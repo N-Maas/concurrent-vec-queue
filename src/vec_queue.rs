@@ -74,7 +74,7 @@ impl<T> Buffer<T> {
         return buffer;
     }
 
-    pub fn at(&mut self, idx: usize) -> &mut T {
+    pub fn at(&self, idx: usize) -> &mut T {
         debug_assert!(idx < self.capacity());
 
         unsafe { &mut *self.ptr.add(idx) }
@@ -97,6 +97,7 @@ impl<T> Drop for Buffer<T> {
 // test with fixed size
 pub struct VecQueue<T> {
     //data: Vec<VFElement<T>>,
+    // TODO: not necessarily required to use UnsafeCell (at least with fixed size)?
     data: UnsafeCell<Buffer<VFElement<T>>>,
     start_idx: AtomicUsize,
     end_idx: AtomicUsize,
@@ -127,8 +128,8 @@ impl<T> VecQueue<T> {
     }
 
     pub fn new(size: usize) -> VecQueue<T> {
-        let queue = VecQueue::<T> {
-            data: UnsafeCell::new(Buffer::<VFElement<T>>::new(size)),
+        let queue = VecQueue {
+            data: UnsafeCell::new(Buffer::new(size)),
             start_idx: AtomicUsize::new(0),
             end_idx: AtomicUsize::new(0),
             min_len: AtomicUsize::new(0),
@@ -177,3 +178,6 @@ impl<T> VecQueue<T> {
         return Some(val);
     }
 }
+
+unsafe impl<T> Sync for VecQueue<T> {}
+unsafe impl<T> Send for VecQueue<T> {}
