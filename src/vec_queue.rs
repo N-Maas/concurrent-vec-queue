@@ -106,21 +106,22 @@ pub struct VecQueue<T> {
     _marker: PhantomData<T>,
 }
 
-// TODO: resizing, drop...
+// TODO: resizing...
 impl<T> VecQueue<T> {
     fn at(&self, idx: usize) -> &mut VFElement<T> {
         unsafe { (*self.data.get()).at(idx) }
     }
 
+    // increases the index, performing modulo if necessary, returning the previous value
     fn increase_idx(idx: &AtomicUsize, len: usize) -> usize {
-        let new_val = idx.fetch_add(1, Ordering::SeqCst);
+        let old_val = idx.fetch_add(1, Ordering::SeqCst);
 
-        if new_val >= len {
-            let mod_val = new_val % len;
-            idx.compare_and_swap(new_val, mod_val, Ordering::SeqCst);
+        if old_val >= len {
+            let mod_val = old_val % len;
+            idx.compare_and_swap(old_val + 1, mod_val + 1, Ordering::SeqCst);
             return mod_val;
         }
-        return new_val;
+        return old_val;
     }
 
     pub fn capacity(&self) -> usize {
@@ -176,6 +177,31 @@ impl<T> VecQueue<T> {
         let val = self.at(idx).read();
         self.max_len.fetch_sub(1, Ordering::SeqCst);
         return Some(val);
+    }
+}
+
+impl<T> Drop for VecQueue<T> {
+    fn drop(&mut self) {
+        if self.max_len.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+
+        let len = self.capacity();
+        let max = self.end_idx.load(Ordering::Relaxed) % len;
+        let mut idx = self.start_idx.load(Ordering::Relaxed);
+
+        // drop all remaining values
+        loop {
+            self.at(idx).read();
+
+            idx += 1;
+            if idx >= len {
+                idx %= len;
+            }
+            if idx == max {
+                break;
+            }
+        }
     }
 }
 

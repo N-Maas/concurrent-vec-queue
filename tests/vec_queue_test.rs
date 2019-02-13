@@ -61,12 +61,7 @@ fn single_producer_single_consumer_test() {
         let mut vec = Vec::new();
 
         for _count in 0..val_count {
-            loop {
-                if let Some(x) = consumer_ptr.pop() {
-                    vec.push(x);
-                    break;
-                }
-            }
+            vec.push(pop_next(&*consumer_ptr));
         }
 
         assert_eq!(consumer_ptr.pop(), None);
@@ -84,6 +79,14 @@ fn single_producer_single_consumer_test() {
 
 fn assert_some_eq<T: Eq + std::fmt::Display + std::fmt::Debug>(val: Option<T>, expected: T) {
     assert_eq!(val.expect("expected Some({}) instead of None"), expected);
+}
+
+fn pop_next<T>(queue: &VecQueue<T>) -> T {
+    loop {
+        if let Some(x) = queue.pop() {
+            return x;
+        }
+    }
 }
 
 // helper struct for parallel testing
