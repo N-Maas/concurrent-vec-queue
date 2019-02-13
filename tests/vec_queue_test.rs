@@ -1,5 +1,7 @@
 use concurrent_vec_queue::VecQueue;
 use std::slice::Iter;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
 
@@ -77,6 +79,26 @@ fn single_producer_single_consumer_test() {
         .assert_contained(results.iter());
 }
 
+#[test]
+fn drop_test() {
+    let count = Arc::new(AtomicUsize::new(0));
+    {
+        let queue = VecQueue::new(5);
+
+        for _ in 0..4 {
+            queue.append(DropCounter::new(count.clone()));
+        }
+        for _ in 0..3 {
+            queue.pop().expect("pop failed unexpectedly");
+        }
+        for _ in 0..2 {
+            queue.append(DropCounter::new(count.clone()));
+        }
+        assert_eq!(count.load(Ordering::Relaxed), 3);
+    }
+    assert_eq!(count.load(Ordering::Relaxed), 6);
+}
+
 fn assert_some_eq<T: Eq + std::fmt::Display + std::fmt::Debug>(val: Option<T>, expected: T) {
     assert_eq!(val.expect("expected Some({}) instead of None"), expected);
 }
@@ -131,5 +153,21 @@ impl Iterator for MarkedStream {
         } else {
             None
         }
+    }
+}
+
+struct DropCounter {
+    count: Arc<AtomicUsize>,
+}
+
+impl DropCounter {
+    fn new(count: Arc<AtomicUsize>) -> DropCounter {
+        DropCounter { count }
+    }
+}
+
+impl Drop for DropCounter {
+    fn drop(&mut self) {
+        self.count.fetch_add(1, Ordering::Relaxed);
     }
 }
