@@ -1,4 +1,5 @@
 use concurrent_vec_queue::VecQueue;
+use std::collections::HashSet;
 use std::slice::Iter;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -99,6 +100,72 @@ fn drop_test() {
     assert_eq!(count.load(Ordering::Relaxed), 6);
 }
 
+#[test]
+fn multi_producer_multi_consumer_test() {
+    let size = 20;
+    let val_count_per_thread = 10000;
+    let thread_count = 32;
+
+    let queue = Arc::new(VecQueue::new(size));
+    let mut producers = Vec::new();
+    let mut consumers = Vec::new();
+
+    for i in 0..thread_count {
+        let queue_ptr = queue.clone();
+
+        producers.push(thread::spawn(move || {
+            let mut stream = MarkedStream::new(i, val_count_per_thread);
+
+            for x in &mut stream {
+                while !queue_ptr.append(x) {}
+            }
+            return stream;
+        }));
+    }
+
+    for _ in 0..thread_count {
+        let queue_ptr = queue.clone();
+
+        consumers.push(thread::spawn(move || {
+            let mut vec = Vec::new();
+
+            for _count in 0..val_count_per_thread {
+                vec.push(pop_next(&*queue_ptr));
+            }
+            return vec;
+        }));
+    }
+
+    // collect the result of the producers: testers
+    let mut testers: Vec<SplitStreamTester> = producers
+        .into_iter()
+        .map(|prod| {
+            prod.join()
+                .expect("unexpected error in producer")
+                .split_tester()
+        })
+        .collect();
+
+    // collect the result of the consumers: vecs containing the elements
+    let results = consumers
+        .into_iter()
+        .map(|c| c.join().expect("unexpected error in consumer"));
+
+    // apply the testers to the results
+    let mut counter = 0;
+    for result_vec in results {
+        counter += result_vec.len();
+        testers
+            .iter_mut()
+            .for_each(|t| t.assert_partly_contained(result_vec.iter()));
+    }
+
+    for t in testers {
+        t.assert_complete();
+    }
+    assert_eq!(counter, thread_count * val_count_per_thread);
+}
+
 fn assert_some_eq<T: Eq + std::fmt::Display + std::fmt::Debug>(val: Option<T>, expected: T) {
     assert_eq!(val.expect("expected Some({}) instead of None"), expected);
 }
@@ -112,6 +179,8 @@ fn pop_next<T>(queue: &VecQueue<T>) -> T {
 }
 
 // helper struct for parallel testing
+// generates an ordered stream of index tuples
+// and tests whether the generated stream is contained
 struct MarkedStream {
     count: usize,
     idx: usize,
@@ -131,14 +200,14 @@ impl MarkedStream {
             if val.0 == self.idx {
                 assert_eq!(val.1, counter);
                 counter += 1;
-
-                if counter == self.len {
-                    break;
-                }
             }
         }
 
         assert_eq!(counter, self.len);
+    }
+
+    pub fn split_tester(&self) -> SplitStreamTester {
+        SplitStreamTester::new(self.idx, self.len)
     }
 }
 
@@ -156,6 +225,37 @@ impl Iterator for MarkedStream {
     }
 }
 
+// test whether a stream is contained, possibly splitted to many collections
+struct SplitStreamTester {
+    idx: usize,
+    len: usize,
+    set: HashSet<usize>,
+}
+
+impl SplitStreamTester {
+    pub fn new(idx: usize, len: usize) -> SplitStreamTester {
+        SplitStreamTester {
+            idx,
+            len,
+            set: HashSet::with_capacity(len),
+        }
+    }
+
+    pub fn assert_partly_contained<'a>(&mut self, iter: Iter<'a, (usize, usize)>) {
+        for val in iter {
+            if val.0 == self.idx {
+                assert!(!self.set.contains(&val.1));
+                self.set.insert(val.1);
+            }
+        }
+    }
+
+    pub fn assert_complete(&self) {
+        assert_eq!(self.set.len(), self.len);
+    }
+}
+
+// counts drops atomically to test for memory safety/leaks
 struct DropCounter {
     count: Arc<AtomicUsize>,
 }
