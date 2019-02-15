@@ -1,46 +1,43 @@
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 use std::mem;
-use std::ptr::read_volatile;
-use std::ptr::write_volatile;
+use std::ptr;
+use std::sync::atomic::AtomicIsize;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::thread;
 
-// volatile and containing a valid flag
-// ensures volatile access, but no (!) synchronisation
+// containing value and access stamp
 pub struct VFElement<T> {
     value: T,
-    // TODO: needs to be atomic?
-    is_valid: bool,
+    stamp: AtomicIsize,
 }
 
 impl<T> VFElement<T> {
-    pub fn is_valid(&self) -> bool {
-        unsafe { read_volatile::<bool>(&self.is_valid as *const bool) }
+    pub fn get_stamp(&self) -> isize {
+        self.stamp.load(Ordering::SeqCst)
     }
 
-    pub fn set_valid(&mut self, val: bool) {
-        unsafe {
-            write_volatile::<bool>(&mut self.is_valid as *mut bool, val);
-        }
+    pub fn set_stamp(&mut self, val: isize) {
+        self.stamp.store(val, Ordering::SeqCst)
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.get_stamp() > 0
     }
 
     pub fn read(&mut self) -> T {
         debug_assert!(self.is_valid());
 
-        let val = unsafe { read_volatile::<T>(&self.value as *const T) };
-        self.set_valid(false);
-        val
+        unsafe { ptr::read(&self.value as *const T) }
     }
 
     pub fn write(&mut self, val: T) {
         debug_assert!(!self.is_valid());
 
         unsafe {
-            write_volatile::<T>(&mut self.value as *mut T, val);
+            ptr::write(&mut self.value as *mut T, val);
         }
-        self.set_valid(true);
     }
 }
 
@@ -112,27 +109,25 @@ impl<T> VecQueue<T> {
         unsafe { (*self.data.get()).at(idx) }
     }
 
-    // increases the index, performing modulo if necessary, returning the previous value
-    fn increase_idx(idx: &AtomicUsize, len: usize) -> usize {
+    // increases the index, performing modulo if necessary
+    // returning a couple of the previous value with and without modulo len (the latter as isize stamp)
+    fn increase_idx(idx: &AtomicUsize, len: usize) -> (usize, isize) {
+        debug_assert!(len.is_power_of_two());
+        debug_assert!(len <= isize::max_value() as usize);
+        // wrapped overflow in AtomicUsize should function correctly (because len is power of two)
         let old_val = idx.fetch_add(1, Ordering::SeqCst);
-
-        if old_val >= len {
-            let mod_val = old_val % len;
-            idx.compare_and_swap(old_val + 1, mod_val + 1, Ordering::SeqCst);
-            return mod_val;
-        }
-        return old_val;
+        return (old_val & (len - 1), (old_val as isize) & isize::max_value());
     }
 
-    pub fn capacity(&self) -> usize {
-        unsafe { (*self.data.get()).capacity() }
-    }
-
+    // size must be a power of two
     pub fn new(size: usize) -> VecQueue<T> {
+        assert!(size <= isize::max_value() as usize);
+        let size = size.next_power_of_two();
+
         let queue = VecQueue {
             data: UnsafeCell::new(Buffer::new(size)),
-            start_idx: AtomicUsize::new(0),
-            end_idx: AtomicUsize::new(0),
+            start_idx: AtomicUsize::new(size),
+            end_idx: AtomicUsize::new(size),
             min_len: AtomicUsize::new(0),
             max_len: AtomicUsize::new(0),
             _marker: PhantomData,
@@ -140,9 +135,13 @@ impl<T> VecQueue<T> {
         debug_assert!(queue.capacity() == size);
 
         for idx in 0..size {
-            queue.at(idx).set_valid(false);
+            queue.at(idx).set_stamp(-(idx as isize));
         }
         return queue;
+    }
+
+    pub fn capacity(&self) -> usize {
+        unsafe { (*self.data.get()).capacity() }
     }
 
     // TODO: more relaxed Ordering possible?
@@ -155,9 +154,15 @@ impl<T> VecQueue<T> {
             return false;
         }
 
-        self.min_len.fetch_add(1, Ordering::SeqCst);
-        let idx = Self::increase_idx(&self.end_idx, self.capacity());
+        let (idx, stamp) = Self::increase_idx(&self.end_idx, self.capacity());
+
+        while !(self.at(idx).get_stamp() == (self.capacity() as isize) - stamp) {
+            thread::yield_now();
+        }
         self.at(idx).write(value);
+        self.at(idx).set_stamp(stamp);
+
+        self.min_len.fetch_add(1, Ordering::SeqCst);
         return true;
     }
 
@@ -170,11 +175,14 @@ impl<T> VecQueue<T> {
             return None;
         }
 
-        let idx = Self::increase_idx(&self.start_idx, self.capacity());
-        while !self.at(idx).is_valid() {
+        let (idx, stamp) = Self::increase_idx(&self.start_idx, self.capacity());
+
+        while !(self.at(idx).get_stamp() == stamp) {
             thread::yield_now();
         }
         let val = self.at(idx).read();
+        self.at(idx).set_stamp(-stamp);
+
         self.max_len.fetch_sub(1, Ordering::SeqCst);
         return Some(val);
     }
@@ -186,21 +194,12 @@ impl<T> Drop for VecQueue<T> {
             return;
         }
 
-        let len = self.capacity();
-        let max = self.end_idx.load(Ordering::Relaxed) % len;
-        let mut idx = self.start_idx.load(Ordering::Relaxed);
+        let start = self.start_idx.load(Ordering::Relaxed);
+        let max = self.end_idx.load(Ordering::Relaxed);
 
         // drop all remaining values
-        loop {
-            self.at(idx).read();
-
-            idx += 1;
-            if idx >= len {
-                idx %= len;
-            }
-            if idx == max {
-                break;
-            }
+        for idx in start..max {
+            self.at(idx & (self.capacity() - 1)).read();
         }
     }
 }
