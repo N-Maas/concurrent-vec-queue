@@ -98,7 +98,7 @@ pub struct VecQueue<T> {
     data: UnsafeCell<Buffer<VFElement<T>>>,
     start_idx: AtomicUsize,
     end_idx: AtomicUsize,
-    min_len: AtomicUsize,
+    max_empty: AtomicUsize,
     max_len: AtomicUsize,
     _marker: PhantomData<T>,
 }
@@ -128,7 +128,7 @@ impl<T> VecQueue<T> {
             data: UnsafeCell::new(Buffer::new(size)),
             start_idx: AtomicUsize::new(size),
             end_idx: AtomicUsize::new(size),
-            min_len: AtomicUsize::new(0),
+            max_empty: AtomicUsize::new(size),
             max_len: AtomicUsize::new(0),
             _marker: PhantomData,
         };
@@ -162,16 +162,16 @@ impl<T> VecQueue<T> {
         self.at(idx).write(value);
         self.at(idx).set_stamp(stamp);
 
-        self.min_len.fetch_add(1, Ordering::SeqCst);
+        self.max_empty.fetch_sub(1, Ordering::SeqCst);
         return true;
     }
 
     pub fn pop(&self) -> Option<T> {
-        let len = self.min_len.fetch_sub(1, Ordering::SeqCst);
+        let empty = self.max_empty.fetch_add(1, Ordering::SeqCst);
 
         // test whether queue is empty
-        if len <= 0 {
-            self.min_len.fetch_add(1, Ordering::SeqCst);
+        if empty >= self.capacity() {
+            self.max_empty.fetch_sub(1, Ordering::SeqCst);
             return None;
         }
 
