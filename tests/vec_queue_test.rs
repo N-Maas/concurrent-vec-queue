@@ -1,4 +1,7 @@
+use concurrent_vec_queue::ProducerConsumerPolicy;
+use concurrent_vec_queue::MPMCPolicy;
 use concurrent_vec_queue::VecQueue;
+
 use std::collections::HashSet;
 use std::slice::Iter;
 use std::sync::atomic::AtomicUsize;
@@ -9,7 +12,7 @@ use std::thread;
 #[test]
 // test correctness in sequential context
 fn basic_sequential_test() {
-    let queue = VecQueue::new(2);
+    let queue = VecQueue::<usize, MPMCPolicy>::new(2);
 
     queue.append(2);
     queue.append(42);
@@ -27,7 +30,7 @@ fn basic_sequential_test() {
 #[test]
 // primarily tests correct parallel semantics (e.g. Sync & Send)
 fn basic_parallel_test() {
-    let queue = Arc::new(VecQueue::new(5));
+    let queue = Arc::new(VecQueue::<usize, MPMCPolicy>::new(5));
     let queue_ptr = queue.clone();
 
     let handle = thread::spawn(move || {
@@ -46,9 +49,9 @@ fn basic_parallel_test() {
 // use very small size and high throughput to make the test as hard as possible
 fn single_producer_single_consumer_test() {
     let size = 10;
-    let val_count = 100000;
+    let val_count = 10000;
 
-    let queue = Arc::new(VecQueue::new(size));
+    let queue = Arc::new(VecQueue::<(usize, usize), MPMCPolicy>::new(size));
     let producer_ptr = queue.clone();
     let consumer_ptr = queue.clone();
 
@@ -84,7 +87,7 @@ fn single_producer_single_consumer_test() {
 fn drop_test() {
     let count = Arc::new(AtomicUsize::new(0));
     {
-        let queue = VecQueue::new(5);
+        let queue = VecQueue::<DropCounter, MPMCPolicy>::new(5);
 
         for _ in 0..4 {
             queue.append(DropCounter::new(count.clone()));
@@ -102,11 +105,11 @@ fn drop_test() {
 
 #[test]
 fn multi_producer_multi_consumer_test() {
-    let size = 20;
-    let val_count_per_thread = 10000;
-    let thread_count = 32;
+    let size = 8;
+    let val_count_per_thread = 1000;
+    let thread_count = 16;
 
-    let queue = Arc::new(VecQueue::new(size));
+    let queue = Arc::new(VecQueue::<(usize, usize), MPMCPolicy>::new(size));
     let mut producers = Vec::new();
     let mut consumers = Vec::new();
 
@@ -170,7 +173,7 @@ fn assert_some_eq<T: Eq + std::fmt::Display + std::fmt::Debug>(val: Option<T>, e
     assert_eq!(val.expect("expected Some({}) instead of None"), expected);
 }
 
-fn pop_next<T>(queue: &VecQueue<T>) -> T {
+fn pop_next<T, S: ProducerConsumerPolicy>(queue: &VecQueue<T, S>) -> T {
     loop {
         if let Some(x) = queue.pop() {
             return x;
