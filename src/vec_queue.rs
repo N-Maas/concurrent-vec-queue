@@ -132,13 +132,9 @@ pub trait ProducerConsumerPolicy {
 
     fn new(size: usize) -> Self;
 
-    // increases the given index, performing modulo if necessary
-    // returns a pair additionally containing a stamp for the indexed element
-    fn increase_idx(
-        idx: &AtomicUsize,
-        len: usize,
-        is_write: bool,
-    ) -> (usize, <Self::Stamp as AtomicStamp>::Value);
+    // returns the fitting stamp for the index (without modulo)
+    fn to_stamp(idx: usize, is_write: bool) -> <Self::Stamp as AtomicStamp>::Value;
+
     // waits for the element to be in valid state for access
     fn wait_for_stamp_on_write<_T>(
         el: &StampedElement<_T, Self::Stamp>,
@@ -159,9 +155,6 @@ pub trait ProducerConsumerPolicy {
     // might do nothing, depending on the policy
     fn len_decrease_hint(&self);
     fn empty_decrease_hint(&self);
-
-    // initial stamp of elements
-    fn init_stamp(idx: usize) -> <Self::Stamp as AtomicStamp>::Value;
 }
 
 // test with fixed size
@@ -181,6 +174,17 @@ impl<T, PCPolicy: ProducerConsumerPolicy> VecQueue<T, PCPolicy> {
         unsafe { (*self.data.get()).at(idx) }
     }
 
+    fn increase_idx(
+        counter: &AtomicUsize,
+        len: usize,
+        is_write: bool,
+    ) -> (usize, <PCPolicy::Stamp as AtomicStamp>::Value) {
+        debug_assert!(len.is_power_of_two());
+
+        let idx = counter.fetch_add(1, Ordering::SeqCst);
+        (idx & (len - 1), PCPolicy::to_stamp(idx, is_write))
+    }
+
     // size must be a power of two
     pub fn new(size: usize) -> VecQueue<T, PCPolicy> {
         // TODO: isize::max_value() + 1 should be legal? (may cause problems with stamp calculations?)
@@ -197,7 +201,7 @@ impl<T, PCPolicy: ProducerConsumerPolicy> VecQueue<T, PCPolicy> {
         debug_assert!(queue.capacity() == size);
 
         for idx in 0..size {
-            queue.at(idx).set_stamp(PCPolicy::init_stamp(idx));
+            queue.at(idx).set_stamp(PCPolicy::to_stamp(idx, false));
         }
         return queue;
     }
@@ -216,7 +220,8 @@ impl<T, PCPolicy: ProducerConsumerPolicy> VecQueue<T, PCPolicy> {
             return false;
         }
 
-        let (idx, stamp) = PCPolicy::increase_idx(&self.end_idx, self.capacity(), true);
+        let (idx, stamp) = Self::increase_idx(&self.end_idx, self.capacity(), true);
+
         PCPolicy::wait_for_stamp_on_write(self.at(idx), self.capacity(), stamp);
         self.at(idx).write(value);
         self.at(idx).set_stamp(stamp);
@@ -234,7 +239,8 @@ impl<T, PCPolicy: ProducerConsumerPolicy> VecQueue<T, PCPolicy> {
             return None;
         }
 
-        let (idx, stamp) = PCPolicy::increase_idx(&self.start_idx, self.capacity(), false);
+        let (idx, stamp) = Self::increase_idx(&self.start_idx, self.capacity(), false);
+
         PCPolicy::wait_for_stamp_on_read(self.at(idx), self.capacity(), stamp);
         let val = self.at(idx).read();
         self.at(idx).set_stamp(stamp);
@@ -279,16 +285,9 @@ impl ProducerConsumerPolicy for MPMCPolicy {
         }
     }
 
-    fn increase_idx(idx: &AtomicUsize, len: usize, is_write: bool) -> (usize, isize) {
-        debug_assert!(len.is_power_of_two());
-        // wrapped overflow in AtomicUsize should function correctly (because len is power of two)
-        let stamp_sign = if is_write { 1 } else { -1 };
-        let old_val = idx.fetch_add(1, Ordering::SeqCst);
-
-        return (
-            old_val & (len - 1),
-            stamp_sign * ((old_val as isize) & isize::max_value()),
-        );
+    fn to_stamp(idx: usize, is_write: bool) -> isize {
+        // wrapped overflow should function correctly here
+        (if is_write { 1 } else { -1 }) * ((idx as isize) & isize::max_value())
     }
 
     // waits for the element to be in valid state for access
@@ -330,11 +329,5 @@ impl ProducerConsumerPolicy for MPMCPolicy {
 
     fn empty_decrease_hint(&self) {
         self.empty.fetch_sub(1, Ordering::SeqCst);
-    }
-
-    fn init_stamp(idx: usize) -> isize {
-        debug_assert!(idx <= isize::max_value() as usize);
-
-        -(idx as isize)
     }
 }
