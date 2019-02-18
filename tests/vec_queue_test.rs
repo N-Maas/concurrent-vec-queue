@@ -1,5 +1,7 @@
-use concurrent_vec_queue::ProducerConsumerPolicy;
 use concurrent_vec_queue::MPMCPolicy;
+use concurrent_vec_queue::MPSCPolicy;
+use concurrent_vec_queue::ProducerConsumerPolicy;
+use concurrent_vec_queue::SPMCPolicy;
 use concurrent_vec_queue::VecQueue;
 
 use std::collections::HashSet;
@@ -10,9 +12,59 @@ use std::sync::Arc;
 use std::thread;
 
 #[test]
+fn mpmc_basic_test() {
+    basic_sequential_test_template::<MPMCPolicy>();
+    basic_parallel_test_template::<MPMCPolicy>();
+    drop_test_template::<MPMCPolicy>();
+}
+
+#[test]
+fn mpmc_single_producer_single_consumer_test() {
+    single_producer_single_consumer_test_template::<MPMCPolicy>(10, 10000);
+}
+
+#[test]
+fn mpmc_multi_producer_multi_consumer_test() {
+    multi_producer_multi_consumer_test_template::<MPMCPolicy>(64, 1000, 16, 16);
+}
+
+#[test]
+fn sc_basic_test() {
+    basic_sequential_test_template::<MPSCPolicy>();
+    basic_parallel_test_template::<MPSCPolicy>();
+    drop_test_template::<MPSCPolicy>();
+}
+
+#[test]
+fn sc_single_producer_single_consumer_test() {
+    single_producer_single_consumer_test_template::<MPSCPolicy>(10, 10000);
+}
+
+#[test]
+fn sc_multi_producer_test() {
+    multi_producer_multi_consumer_test_template::<MPSCPolicy>(32, 1000, 16, 1);
+}
+
+#[test]
+fn sp_basic_test() {
+    basic_sequential_test_template::<SPMCPolicy>();
+    basic_parallel_test_template::<SPMCPolicy>();
+    drop_test_template::<SPMCPolicy>();
+}
+
+#[test]
+fn sp_single_producer_single_consumer_test() {
+    single_producer_single_consumer_test_template::<SPMCPolicy>(10, 10000);
+}
+
+#[test]
+fn sp_multi_consumer_test() {
+    multi_producer_multi_consumer_test_template::<SPMCPolicy>(32, 16000, 1, 16);
+}
+
 // test correctness in sequential context
-fn basic_sequential_test() {
-    let queue = VecQueue::<usize, MPMCPolicy>::new(2);
+fn basic_sequential_test_template<PCPolicy: ProducerConsumerPolicy>() {
+    let queue = VecQueue::<usize, PCPolicy>::new(2);
 
     queue.append(2);
     queue.append(42);
@@ -27,10 +79,9 @@ fn basic_sequential_test() {
     assert_eq!(queue.pop(), None);
 }
 
-#[test]
 // primarily tests correct parallel semantics (e.g. Sync & Send)
-fn basic_parallel_test() {
-    let queue = Arc::new(VecQueue::<usize, MPMCPolicy>::new(5));
+fn basic_parallel_test_template<PCPolicy: 'static + ProducerConsumerPolicy>() {
+    let queue = Arc::new(VecQueue::<usize, PCPolicy>::new(5));
     let queue_ptr = queue.clone();
 
     let handle = thread::spawn(move || {
@@ -45,13 +96,31 @@ fn basic_parallel_test() {
     }
 }
 
-#[test]
-// use very small size and high throughput to make the test as hard as possible
-fn single_producer_single_consumer_test() {
-    let size = 10;
-    let val_count = 10000;
+fn drop_test_template<PCPolicy: ProducerConsumerPolicy>() {
+    let count = Arc::new(AtomicUsize::new(0));
+    {
+        let queue = VecQueue::<DropCounter, PCPolicy>::new(5);
 
-    let queue = Arc::new(VecQueue::<(usize, usize), MPMCPolicy>::new(size));
+        for _ in 0..4 {
+            queue.append(DropCounter::new(count.clone()));
+        }
+        for _ in 0..3 {
+            queue.pop().expect("pop failed unexpectedly");
+        }
+        for _ in 0..2 {
+            queue.append(DropCounter::new(count.clone()));
+        }
+        assert_eq!(count.load(Ordering::Relaxed), 3);
+    }
+    assert_eq!(count.load(Ordering::Relaxed), 6);
+}
+
+// use very small size and high throughput to make the test as hard as possible
+fn single_producer_single_consumer_test_template<PCPolicy: 'static + ProducerConsumerPolicy>(
+    size: usize,
+    val_count: usize,
+) {
+    let queue = Arc::new(VecQueue::<(usize, usize), PCPolicy>::new(size));
     let producer_ptr = queue.clone();
     let consumer_ptr = queue.clone();
 
@@ -83,37 +152,20 @@ fn single_producer_single_consumer_test() {
         .assert_contained(results.iter());
 }
 
-#[test]
-fn drop_test() {
-    let count = Arc::new(AtomicUsize::new(0));
-    {
-        let queue = VecQueue::<DropCounter, MPMCPolicy>::new(5);
+// TODO: read/write access
+fn multi_producer_multi_consumer_test_template<PCPolicy: 'static + ProducerConsumerPolicy>(
+    size: usize,
+    val_count_per_thread: usize,
+    producer_count: usize,
+    consumer_count: usize,
+) {
+    assert!((producer_count * val_count_per_thread) % consumer_count == 0);
 
-        for _ in 0..4 {
-            queue.append(DropCounter::new(count.clone()));
-        }
-        for _ in 0..3 {
-            queue.pop().expect("pop failed unexpectedly");
-        }
-        for _ in 0..2 {
-            queue.append(DropCounter::new(count.clone()));
-        }
-        assert_eq!(count.load(Ordering::Relaxed), 3);
-    }
-    assert_eq!(count.load(Ordering::Relaxed), 6);
-}
-
-#[test]
-fn multi_producer_multi_consumer_test() {
-    let size = 8;
-    let val_count_per_thread = 1000;
-    let thread_count = 16;
-
-    let queue = Arc::new(VecQueue::<(usize, usize), MPMCPolicy>::new(size));
+    let queue = Arc::new(VecQueue::<(usize, usize), PCPolicy>::new(size));
     let mut producers = Vec::new();
     let mut consumers = Vec::new();
 
-    for i in 0..thread_count {
+    for i in 0..producer_count {
         let queue_ptr = queue.clone();
 
         producers.push(thread::spawn(move || {
@@ -126,13 +178,14 @@ fn multi_producer_multi_consumer_test() {
         }));
     }
 
-    for _ in 0..thread_count {
+    for _ in 0..consumer_count {
         let queue_ptr = queue.clone();
 
         consumers.push(thread::spawn(move || {
             let mut vec = Vec::new();
+            let num = (producer_count * val_count_per_thread) / consumer_count;
 
-            for _count in 0..val_count_per_thread {
+            for _count in 0..num {
                 vec.push(pop_next(&*queue_ptr));
             }
             return vec;
@@ -166,11 +219,14 @@ fn multi_producer_multi_consumer_test() {
     for t in testers {
         t.assert_complete();
     }
-    assert_eq!(counter, thread_count * val_count_per_thread);
+    assert_eq!(counter, producer_count * val_count_per_thread);
 }
 
 fn assert_some_eq<T: Eq + std::fmt::Display + std::fmt::Debug>(val: Option<T>, expected: T) {
-    assert_eq!(val.expect("expected Some({}) instead of None"), expected);
+    assert_eq!(
+        val.expect(&format!("expected Some({}) instead of None", expected)),
+        expected
+    );
 }
 
 fn pop_next<T, S: ProducerConsumerPolicy>(queue: &VecQueue<T, S>) -> T {

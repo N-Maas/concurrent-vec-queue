@@ -138,18 +138,18 @@ pub trait ProducerConsumerPolicy {
     // waits for the element to be in valid state for access
     fn wait_for_stamp_on_write<_T>(
         el: &StampedElement<_T, Self::Stamp>,
-        len: usize,
+        cap: usize,
         requested: <Self::Stamp as AtomicStamp>::Value,
     );
     fn wait_for_stamp_on_read<_T>(
         el: &StampedElement<_T, Self::Stamp>,
-        len: usize,
+        cap: usize,
         requested: <Self::Stamp as AtomicStamp>::Value,
     );
 
     // request an upper bound, possibly (depending on policy) increasing it
-    fn request_len_bound(&self) -> usize;
-    fn request_empty_bound(&self) -> usize;
+    fn request_len_bound(&self, cap: usize) -> usize;
+    fn request_empty_bound(&self, cap: usize) -> usize;
 
     // hint, that the according value should be decreased
     // might do nothing, depending on the policy
@@ -212,7 +212,7 @@ impl<T, PCPolicy: ProducerConsumerPolicy> VecQueue<T, PCPolicy> {
 
     // TODO: more relaxed Ordering possible?
     pub fn append(&self, value: T) -> bool {
-        let len = self.pc_policy.request_len_bound();
+        let len = self.pc_policy.request_len_bound(self.capacity());
 
         // test whether queue is full
         if len >= self.capacity() {
@@ -231,7 +231,7 @@ impl<T, PCPolicy: ProducerConsumerPolicy> VecQueue<T, PCPolicy> {
     }
 
     pub fn pop(&self) -> Option<T> {
-        let empty = self.pc_policy.request_empty_bound();
+        let empty = self.pc_policy.request_empty_bound(self.capacity());
 
         // test whether queue is empty
         if empty >= self.capacity() {
@@ -252,7 +252,7 @@ impl<T, PCPolicy: ProducerConsumerPolicy> VecQueue<T, PCPolicy> {
 
 impl<T, P: ProducerConsumerPolicy> Drop for VecQueue<T, P> {
     fn drop(&mut self) {
-        if self.pc_policy.request_len_bound() == 0 {
+        if self.pc_policy.request_len_bound(self.capacity()) == 0 {
             return;
         }
 
@@ -290,23 +290,23 @@ impl ProducerConsumerPolicy for MPMCPolicy {
         (if is_write { 1 } else { -1 }) * ((idx as isize) & isize::max_value())
     }
 
-    // waits for the element to be in valid state for access
+    // waits for the correct access stamp
     fn wait_for_stamp_on_write<_T>(
         el: &StampedElement<_T, AtomicIsize>,
-        len: usize,
+        cap: usize,
         requested: isize,
     ) {
-        debug_assert!(len.is_power_of_two());
-        debug_assert!(len <= isize::max_value() as usize);
+        debug_assert!(cap.is_power_of_two());
+        debug_assert!(cap <= isize::max_value() as usize);
 
-        while !(el.get_stamp() == (len as isize) - requested) {
+        while !(el.get_stamp() == (cap as isize) - requested) {
             thread::yield_now();
         }
     }
 
     fn wait_for_stamp_on_read<_T>(
         el: &StampedElement<_T, AtomicIsize>,
-        _len: usize,
+        _cap: usize,
         requested: isize,
     ) {
         while !(el.get_stamp() == -requested) {
@@ -314,18 +314,142 @@ impl ProducerConsumerPolicy for MPMCPolicy {
         }
     }
 
-    // request an upper bound, possibly (depending on policy) increasing it
-    fn request_len_bound(&self) -> usize {
+    // request an upper bound, increasing it
+    fn request_len_bound(&self, _cap: usize) -> usize {
         self.len.fetch_add(1, Ordering::SeqCst)
     }
 
-    fn request_empty_bound(&self) -> usize {
+    fn request_empty_bound(&self, _cap: usize) -> usize {
         self.empty.fetch_add(1, Ordering::SeqCst)
     }
 
     fn len_decrease_hint(&self) {
         self.len.fetch_sub(1, Ordering::SeqCst);
     }
+
+    fn empty_decrease_hint(&self) {
+        self.empty.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+// multiple producer/single consumer policy
+pub struct MPSCPolicy {
+    len: AtomicUsize,
+}
+
+impl ProducerConsumerPolicy for MPSCPolicy {
+    type Stamp = AtomicBool;
+
+    fn new(_size: usize) -> MPSCPolicy {
+        MPSCPolicy {
+            len: AtomicUsize::new(0),
+        }
+    }
+
+    fn to_stamp(_idx: usize, is_write: bool) -> bool {
+        is_write
+    }
+
+    // write does not need to wait
+    fn wait_for_stamp_on_write<_T>(
+        _el: &StampedElement<_T, AtomicBool>,
+        _len: usize,
+        requested: bool,
+    ) {
+        debug_assert!(requested);
+    }
+
+    fn wait_for_stamp_on_read<_T>(
+        el: &StampedElement<_T, AtomicBool>,
+        _len: usize,
+        requested: bool,
+    ) {
+        debug_assert!(!requested);
+
+        while !el.get_stamp() {
+            thread::yield_now();
+        }
+    }
+
+    fn request_len_bound(&self, _cap: usize) -> usize {
+        self.len.fetch_add(1, Ordering::SeqCst)
+    }
+
+    // with only one consumer, empty can be calculated using len
+    // len might temporarily be higher then the capacity
+    fn request_empty_bound(&self, cap: usize) -> usize {
+        let len = self.len.load(Ordering::SeqCst);
+
+        if len < cap {
+            cap - len
+        } else {
+            0
+        }
+    }
+
+    fn len_decrease_hint(&self) {
+        self.len.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    fn empty_decrease_hint(&self) {}
+}
+
+// single producer/multiple consumer policy
+pub struct SPMCPolicy {
+    empty: AtomicUsize,
+}
+
+impl ProducerConsumerPolicy for SPMCPolicy {
+    type Stamp = AtomicBool;
+
+    fn new(size: usize) -> SPMCPolicy {
+        SPMCPolicy {
+            empty: AtomicUsize::new(size),
+        }
+    }
+
+    fn to_stamp(_idx: usize, is_write: bool) -> bool {
+        is_write
+    }
+
+    // write does not need to wait
+    fn wait_for_stamp_on_write<_T>(
+        el: &StampedElement<_T, AtomicBool>,
+        _len: usize,
+        requested: bool,
+    ) {
+        debug_assert!(requested);
+
+        while el.get_stamp() {
+            thread::yield_now();
+        }
+    }
+
+    fn wait_for_stamp_on_read<_T>(
+        _el: &StampedElement<_T, AtomicBool>,
+        _len: usize,
+        requested: bool,
+    ) {
+        debug_assert!(!requested);
+    }
+
+    // with only one producer, len can be calculated using empty
+    // empty might temporarily be higher then the capacity
+    fn request_len_bound(&self, cap: usize) -> usize {
+        let empty = self.empty.load(Ordering::SeqCst);
+
+        if empty < cap {
+            cap - empty
+        } else {
+            0
+        }
+    }
+
+    fn request_empty_bound(&self, _cap: usize) -> usize {
+        self.empty.fetch_add(1, Ordering::SeqCst)
+    }
+
+    fn len_decrease_hint(&self) {}
 
     fn empty_decrease_hint(&self) {
         self.empty.fetch_sub(1, Ordering::SeqCst);
