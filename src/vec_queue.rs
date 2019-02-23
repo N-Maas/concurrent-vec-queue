@@ -3,6 +3,7 @@ use std::marker::PhantomData;
 use std::mem;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread;
 
 // helper trait for handling atomic isize and bool stamps uniformly
@@ -91,7 +92,7 @@ struct Buffer<T> {
 }
 
 impl<T> Buffer<T> {
-    pub fn new(size: usize) -> Buffer<T> {
+    pub fn new(size: usize) -> Self {
         let mut v = Vec::<T>::with_capacity(size);
 
         let buffer = Buffer::<T> {
@@ -174,6 +175,8 @@ impl<T, PCPolicy: ProducerConsumerPolicy> VecQueue<T, PCPolicy> {
         unsafe { (*self.data.get()).at(idx) }
     }
 
+    // increases the given index, returning the old value modulo capacity
+    // additionally returns the stamp for the index
     fn increase_idx(
         counter: &AtomicUsize,
         len: usize,
@@ -185,8 +188,8 @@ impl<T, PCPolicy: ProducerConsumerPolicy> VecQueue<T, PCPolicy> {
         (idx & (len - 1), PCPolicy::to_stamp(idx, is_write))
     }
 
-    // size must be a power of two
-    pub fn new(size: usize) -> VecQueue<T, PCPolicy> {
+    // size is always a power of two
+    fn new(size: usize) -> Self {
         // TODO: isize::max_value() + 1 should be legal? (may cause problems with stamp calculations?)
         assert!(size <= isize::max_value() as usize);
         let size = size.next_power_of_two();
@@ -269,6 +272,96 @@ impl<T, P: ProducerConsumerPolicy> Drop for VecQueue<T, P> {
 unsafe impl<T, P: ProducerConsumerPolicy> Sync for VecQueue<T, P> {}
 unsafe impl<T, P: ProducerConsumerPolicy> Send for VecQueue<T, P> {}
 
+// ---
+// implement the (PC-policy dependent) possibilities for creating a queue
+
+pub trait MultiProducer<T>: Sync + Send + Clone {
+    fn append(&self, value: T) -> bool;
+}
+
+pub trait SingleProducer<T>: Sync + Send {
+    fn append(&mut self, value: T) -> bool;
+}
+
+pub trait MultiConsumer<T>: Sync + Send + Clone {
+    fn pop(&self) -> Option<T>;
+}
+
+pub trait SingleConsumer<T>: Sync + Send {
+    fn pop(&mut self) -> Option<T>;
+}
+
+pub struct Producer<T, PCPolicy: ProducerConsumerPolicy> {
+    ptr: Arc<VecQueue<T, PCPolicy>>,
+}
+
+impl<T> Clone for Producer<T, MPSCPolicy> {
+    fn clone(&self) -> Self {
+        Producer {
+            ptr: self.ptr.clone(),
+        }
+    }
+}
+
+impl<T> MultiProducer<T> for Producer<T, MPSCPolicy> {
+    fn append(&self, value: T) -> bool {
+        self.ptr.append(value)
+    }
+}
+
+impl<T> SingleProducer<T> for Producer<T, SPMCPolicy> {
+    fn append(&mut self, value: T) -> bool {
+        self.ptr.append(value)
+    }
+}
+
+pub struct Consumer<T, PCPolicy: ProducerConsumerPolicy> {
+    ptr: Arc<VecQueue<T, PCPolicy>>,
+}
+
+impl<T> Clone for Consumer<T, SPMCPolicy> {
+    fn clone(&self) -> Self {
+        Consumer {
+            ptr: self.ptr.clone(),
+        }
+    }
+}
+
+impl<T> MultiConsumer<T> for Consumer<T, SPMCPolicy> {
+    fn pop(&self) -> Option<T> {
+        self.ptr.pop()
+    }
+}
+
+impl<T> SingleConsumer<T> for Consumer<T, MPSCPolicy> {
+    fn pop(&mut self) -> Option<T> {
+        self.ptr.pop()
+    }
+}
+
+impl<T> VecQueue<T, MPMCPolicy> {
+    pub fn with_capacity(size: usize) -> VecQueue<T, MPMCPolicy> {
+        VecQueue::new(size)
+    }
+}
+
+impl<T> VecQueue<T, MPSCPolicy> {
+    pub fn with_capacity(size: usize) -> (Producer<T, MPSCPolicy>, Consumer<T, MPSCPolicy>) {
+        let ptr = Arc::new(VecQueue::<T, MPSCPolicy>::new(size));
+        (Producer { ptr: ptr.clone() }, Consumer { ptr })
+    }
+}
+
+impl<T> VecQueue<T, SPMCPolicy> {
+    pub fn with_capacity(size: usize) -> (Producer<T, SPMCPolicy>, Consumer<T, SPMCPolicy>) {
+        let ptr = Arc::new(VecQueue::<T, SPMCPolicy>::new(size));
+        (Producer { ptr: ptr.clone() }, Consumer { ptr })
+    }
+}
+
+// ---
+// implement the policies
+
 // multiple producer/multiple consumer policy
 pub struct MPMCPolicy {
     empty: AtomicUsize,
@@ -278,7 +371,7 @@ pub struct MPMCPolicy {
 impl ProducerConsumerPolicy for MPMCPolicy {
     type Stamp = AtomicIsize;
 
-    fn new(size: usize) -> MPMCPolicy {
+    fn new(size: usize) -> Self {
         MPMCPolicy {
             empty: AtomicUsize::new(size),
             len: AtomicUsize::new(0),
@@ -340,7 +433,7 @@ pub struct MPSCPolicy {
 impl ProducerConsumerPolicy for MPSCPolicy {
     type Stamp = AtomicBool;
 
-    fn new(_size: usize) -> MPSCPolicy {
+    fn new(_size: usize) -> Self {
         MPSCPolicy {
             len: AtomicUsize::new(0),
         }
@@ -402,7 +495,7 @@ pub struct SPMCPolicy {
 impl ProducerConsumerPolicy for SPMCPolicy {
     type Stamp = AtomicBool;
 
-    fn new(size: usize) -> SPMCPolicy {
+    fn new(size: usize) -> Self {
         SPMCPolicy {
             empty: AtomicUsize::new(size),
         }

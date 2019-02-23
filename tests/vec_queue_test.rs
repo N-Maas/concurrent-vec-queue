@@ -1,10 +1,8 @@
-use concurrent_vec_queue::MPMCPolicy;
-use concurrent_vec_queue::MPSCPolicy;
-use concurrent_vec_queue::ProducerConsumerPolicy;
-use concurrent_vec_queue::SPMCPolicy;
-use concurrent_vec_queue::VecQueue;
+use concurrent_vec_queue::*;
 
+use std::cell::UnsafeCell;
 use std::collections::HashSet;
+use std::marker::PhantomData;
 use std::slice::Iter;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -13,102 +11,103 @@ use std::thread;
 
 #[test]
 fn mpmc_basic_test() {
-    basic_sequential_test_template::<MPMCPolicy>();
-    basic_parallel_test_template::<MPMCPolicy>();
-    drop_test_template::<MPMCPolicy>();
+    basic_sequential_test_template::<MPMCType<usize>>();
+    basic_parallel_test_template::<MPMCType<usize>>();
+    drop_test_template::<MPMCType<DropCounter>>();
 }
 
 #[test]
 fn mpmc_single_producer_single_consumer_test() {
-    single_producer_single_consumer_test_template::<MPMCPolicy>(10, 10000);
+    single_producer_single_consumer_test_template::<MPMCType<(usize, usize)>>(10, 10000);
 }
 
 #[test]
 fn mpmc_multi_producer_multi_consumer_test() {
-    multi_producer_multi_consumer_test_template::<MPMCPolicy>(64, 1000, 16, 16);
+    multi_producer_multi_consumer_test_template::<MPMCType<(usize, usize)>>(8, 50, 16, 16);
+    multi_producer_multi_consumer_test_template::<MPMCType<(usize, usize)>>(64, 1000, 8, 8);
 }
 
 #[test]
 fn sc_basic_test() {
-    basic_sequential_test_template::<MPSCPolicy>();
-    basic_parallel_test_template::<MPSCPolicy>();
-    drop_test_template::<MPSCPolicy>();
+    basic_sequential_test_template::<MPSCType<usize>>();
+    basic_parallel_test_template::<MPSCType<usize>>();
+    drop_test_template::<MPSCType<DropCounter>>();
 }
 
 #[test]
 fn sc_single_producer_single_consumer_test() {
-    single_producer_single_consumer_test_template::<MPSCPolicy>(10, 10000);
+    single_producer_single_consumer_test_template::<MPSCType<(usize, usize)>>(10, 10000);
 }
 
 #[test]
 fn sc_multi_producer_test() {
-    multi_producer_multi_consumer_test_template::<MPSCPolicy>(32, 1000, 16, 1);
+    multi_producer_multi_consumer_test_template::<MPSCType<(usize, usize)>>(32, 1000, 16, 1);
 }
 
 #[test]
 fn sp_basic_test() {
-    basic_sequential_test_template::<SPMCPolicy>();
-    basic_parallel_test_template::<SPMCPolicy>();
-    drop_test_template::<SPMCPolicy>();
+    basic_sequential_test_template::<SPMCType<usize>>();
+    basic_parallel_test_template::<SPMCType<usize>>();
+    drop_test_template::<SPMCType<DropCounter>>();
 }
 
 #[test]
 fn sp_single_producer_single_consumer_test() {
-    single_producer_single_consumer_test_template::<SPMCPolicy>(10, 10000);
+    single_producer_single_consumer_test_template::<SPMCType<(usize, usize)>>(10, 10000);
 }
 
 #[test]
 fn sp_multi_consumer_test() {
-    multi_producer_multi_consumer_test_template::<SPMCPolicy>(32, 16000, 1, 16);
+    multi_producer_multi_consumer_test_template::<SPMCType<(usize, usize)>>(32, 16000, 1, 16);
 }
 
 // test correctness in sequential context
-fn basic_sequential_test_template<PCPolicy: ProducerConsumerPolicy>() {
-    let queue = VecQueue::<usize, PCPolicy>::new(2);
+fn basic_sequential_test_template<QType: QueueType<usize>>() {
+    let (prod, con) = QType::create(2);
 
-    queue.append(2);
-    queue.append(42);
-    assert_some_eq(queue.pop(), 2);
+    prod.append(2);
+    prod.append(42);
+    assert_some_eq(con.pop(), 2);
 
-    queue.append(33);
+    prod.append(33);
     // only for fixed size
-    assert!(!queue.append(10), "queue is already full");
+    assert!(!prod.append(10), "queue is already full");
 
-    assert_some_eq(queue.pop(), 42);
-    assert_some_eq(queue.pop(), 33);
-    assert_eq!(queue.pop(), None);
+    assert_some_eq(con.pop(), 42);
+    assert_some_eq(con.pop(), 33);
+    assert_eq!(con.pop(), None);
 }
 
 // primarily tests correct parallel semantics (e.g. Sync & Send)
-fn basic_parallel_test_template<PCPolicy: 'static + ProducerConsumerPolicy>() {
-    let queue = Arc::new(VecQueue::<usize, PCPolicy>::new(5));
-    let queue_ptr = queue.clone();
+fn basic_parallel_test_template<QType: 'static + QueueType<usize>>() {
+    let (prod, con) = QType::create(5);
 
     let handle = thread::spawn(move || {
         for i in 0..5 {
-            queue_ptr.append(i);
+            prod.append(i);
         }
     });
     handle.join().expect("thread returned unexpected error");
 
     for i in 0..5 {
-        assert_some_eq(queue.pop(), i);
+        assert_some_eq(con.pop(), i);
     }
 }
 
-fn drop_test_template<PCPolicy: ProducerConsumerPolicy>() {
+fn drop_test_template<QType: QueueType<DropCounter>>() {
+    let (prod, con) = QType::create(5);
     let count = Arc::new(AtomicUsize::new(0));
     {
-        let queue = VecQueue::<DropCounter, PCPolicy>::new(5);
+        let (p, c) = (prod, con);
 
         for _ in 0..4 {
-            queue.append(DropCounter::new(count.clone()));
+            p.append(DropCounter::new(count.clone()));
         }
         for _ in 0..3 {
-            queue.pop().expect("pop failed unexpectedly");
+            c.pop().expect("pop failed unexpectedly");
         }
         for _ in 0..2 {
-            queue.append(DropCounter::new(count.clone()));
+            p.append(DropCounter::new(count.clone()));
         }
         assert_eq!(count.load(Ordering::Relaxed), 3);
     }
@@ -116,19 +115,17 @@ fn drop_test_template<PCPolicy: ProducerConsumerPolicy>() {
 }
 
 // use very small size and high throughput to make the test as hard as possible
-fn single_producer_single_consumer_test_template<PCPolicy: 'static + ProducerConsumerPolicy>(
+fn single_producer_single_consumer_test_template<QType: 'static + QueueType<(usize, usize)>>(
     size: usize,
     val_count: usize,
 ) {
-    let queue = Arc::new(VecQueue::<(usize, usize), PCPolicy>::new(size));
-    let producer_ptr = queue.clone();
-    let consumer_ptr = queue.clone();
+    let (prod, con) = QType::create(size);
 
     let producer = thread::spawn(move || {
         let mut stream = MarkedStream::new(0, val_count);
 
         for x in &mut stream {
-            while !producer_ptr.append(x) {}
+            while !prod.append(x) {}
         }
         return stream;
     });
@@ -136,10 +133,10 @@ fn single_producer_single_consumer_test_template<PCPolicy: 'static + ProducerCon
         let mut vec = Vec::new();
 
         for _count in 0..val_count {
-            vec.push(pop_next(&*consumer_ptr));
+            vec.push(pop_next(&con));
         }
 
-        assert_eq!(consumer_ptr.pop(), None);
+        assert_eq!(con.pop(), None);
         return vec;
     });
 
@@ -152,8 +149,7 @@ fn single_producer_single_consumer_test_template<PCPolicy: 'static + ProducerCon
         .assert_contained(results.iter());
 }
 
-// TODO: read/write access
-fn multi_producer_multi_consumer_test_template<PCPolicy: 'static + ProducerConsumerPolicy>(
+fn multi_producer_multi_consumer_test_template<QType: 'static + QueueType<(usize, usize)>>(
     size: usize,
     val_count_per_thread: usize,
     producer_count: usize,
@@ -161,39 +157,50 @@ fn multi_producer_multi_consumer_test_template<PCPolicy: 'static + ProducerConsu
 ) {
     assert!((producer_count * val_count_per_thread) % consumer_count == 0);
 
-    let queue = Arc::new(VecQueue::<(usize, usize), PCPolicy>::new(size));
+    let (prod, con) = QType::create(size);
     let mut producers = Vec::new();
+    producers.push(prod);
+    for _ in 1..producer_count {
+        producers.push(producers[0].clone());
+    }
     let mut consumers = Vec::new();
+    consumers.push(con);
+    for _ in 1..consumer_count {
+        consumers.push(consumers[0].clone());
+    }
+
+    let mut prod_threads = Vec::new();
+    let mut con_threads = Vec::new();
 
     for i in 0..producer_count {
-        let queue_ptr = queue.clone();
+        let p = producers.pop().unwrap();
 
-        producers.push(thread::spawn(move || {
+        prod_threads.push(thread::spawn(move || {
             let mut stream = MarkedStream::new(i, val_count_per_thread);
 
             for x in &mut stream {
-                while !queue_ptr.append(x) {}
+                while !p.append(x) {}
             }
             return stream;
         }));
     }
 
     for _ in 0..consumer_count {
-        let queue_ptr = queue.clone();
+        let c = consumers.pop().unwrap();
 
-        consumers.push(thread::spawn(move || {
+        con_threads.push(thread::spawn(move || {
             let mut vec = Vec::new();
             let num = (producer_count * val_count_per_thread) / consumer_count;
 
             for _count in 0..num {
-                vec.push(pop_next(&*queue_ptr));
+                vec.push(pop_next(&c));
             }
             return vec;
         }));
     }
 
-    // collect the result of the producers: testers
-    let mut testers: Vec<SplitStreamTester> = producers
+    // collect the result of the prod_threads: testers
+    let mut testers: Vec<SplitStreamTester> = prod_threads
         .into_iter()
         .map(|prod| {
             prod.join()
@@ -202,8 +209,8 @@ fn multi_producer_multi_consumer_test_template<PCPolicy: 'static + ProducerConsu
         })
         .collect();
 
-    // collect the result of the consumers: vecs containing the elements
-    let results = consumers
+    // collect the result of the con_threads: vecs containing the elements
+    let results = con_threads
         .into_iter()
         .map(|c| c.join().expect("unexpected error in consumer"));
 
@@ -222,16 +229,16 @@ fn multi_producer_multi_consumer_test_template<PCPolicy: 'static + ProducerConsu
     assert_eq!(counter, producer_count * val_count_per_thread);
 }
 
-fn assert_some_eq<T: Eq + std::fmt::Display + std::fmt::Debug>(val: Option<T>, expected: T) {
+fn assert_some_eq<T: Eq + std::fmt::Debug>(val: Option<T>, expected: T) {
     assert_eq!(
-        val.expect(&format!("expected Some({}) instead of None", expected)),
+        val.expect(&format!("expected Some({:?}) instead of None", expected)),
         expected
     );
 }
 
-fn pop_next<T, S: ProducerConsumerPolicy>(queue: &VecQueue<T, S>) -> T {
+fn pop_next<T>(consumer: &impl MultiConsumer<T>) -> T {
     loop {
-        if let Some(x) = queue.pop() {
+        if let Some(x) = consumer.pop() {
             return x;
         }
     }
@@ -328,5 +335,121 @@ impl DropCounter {
 impl Drop for DropCounter {
     fn drop(&mut self) {
         self.count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+// structs for handling (with only a bit unsafety) different queues uniformly
+trait QueueType<T> {
+    type PType: MultiProducer<T>;
+    type CType: MultiConsumer<T>;
+
+    fn create(size: usize) -> (Self::PType, Self::CType);
+}
+
+struct MPMCType<T> {
+    queue: Arc<VecQueue<T, MPMCPolicy>>,
+}
+
+impl<T> Clone for MPMCType<T> {
+    fn clone(&self) -> Self {
+        MPMCType {
+            queue: self.queue.clone(),
+        }
+    }
+}
+
+impl<T> MultiProducer<T> for MPMCType<T> {
+    fn append(&self, value: T) -> bool {
+        self.queue.append(value)
+    }
+}
+
+impl<T> MultiConsumer<T> for MPMCType<T> {
+    fn pop(&self) -> Option<T> {
+        self.queue.pop()
+    }
+}
+
+impl<T> QueueType<T> for MPMCType<T> {
+    type PType = MPMCType<T>;
+    type CType = MPMCType<T>;
+
+    fn create(size: usize) -> (MPMCType<T>, MPMCType<T>) {
+        let queue_w = MPMCType {
+            queue: Arc::new(VecQueue::<T, MPMCPolicy>::with_capacity(size)),
+        };
+        (queue_w.clone(), queue_w)
+    }
+}
+
+struct MPSCType<T> {
+    consumer: UnsafeCell<Consumer<T, MPSCPolicy>>,
+    _m: PhantomData<T>,
+}
+
+unsafe impl<T> Sync for MPSCType<T> {}
+unsafe impl<T> Send for MPSCType<T> {}
+
+impl<T> Clone for MPSCType<T> {
+    fn clone(&self) -> Self {
+        panic!("illegal clone on wrapper for single consumer");
+    }
+}
+
+impl<T> MultiConsumer<T> for MPSCType<T> {
+    fn pop(&self) -> Option<T> {
+        unsafe { (*self.consumer.get()).pop() }
+    }
+}
+
+impl<T> QueueType<T> for MPSCType<T> {
+    type PType = Producer<T, MPSCPolicy>;
+    type CType = MPSCType<T>;
+
+    fn create(size: usize) -> (Producer<T, MPSCPolicy>, MPSCType<T>) {
+        let (p, c) = VecQueue::<T, MPSCPolicy>::with_capacity(size);
+        (
+            p,
+            MPSCType {
+                consumer: UnsafeCell::new(c),
+                _m: PhantomData,
+            },
+        )
+    }
+}
+
+struct SPMCType<T> {
+    producer: UnsafeCell<Producer<T, SPMCPolicy>>,
+    _m: PhantomData<T>,
+}
+
+unsafe impl<T> Sync for SPMCType<T> {}
+unsafe impl<T> Send for SPMCType<T> {}
+
+impl<T> Clone for SPMCType<T> {
+    fn clone(&self) -> Self {
+        panic!("illegal clone on wrapper for single producer");
+    }
+}
+
+impl<T> MultiProducer<T> for SPMCType<T> {
+    fn append(&self, value: T) -> bool {
+        unsafe { (*self.producer.get()).append(value) }
+    }
+}
+
+impl<T> QueueType<T> for SPMCType<T> {
+    type PType = SPMCType<T>;
+    type CType = Consumer<T, SPMCPolicy>;
+
+    fn create(size: usize) -> (SPMCType<T>, Consumer<T, SPMCPolicy>) {
+        let (p, c) = VecQueue::<T, SPMCPolicy>::with_capacity(size);
+        (
+            SPMCType {
+                producer: UnsafeCell::new(p),
+                _m: PhantomData,
+            },
+            c,
+        )
     }
 }
