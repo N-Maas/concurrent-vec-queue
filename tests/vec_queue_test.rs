@@ -1,8 +1,6 @@
 use concurrent_vec_queue::*;
 
-use std::cell::UnsafeCell;
 use std::collections::HashSet;
-use std::marker::PhantomData;
 use std::slice::Iter;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -338,12 +336,34 @@ impl Drop for DropCounter {
     }
 }
 
-// structs for handling (with only a bit unsafety) different queues uniformly
+// structs for handling different queues uniformly
+// illegal clone is handled by panicking
+// - is this really safe?
 trait QueueType<T> {
-    type PType: MultiProducer<T>;
-    type CType: MultiConsumer<T>;
+    type PType: MultiProducer<T> + Clone + Send;
+    type CType: MultiConsumer<T> + Clone + Send;
 
     fn create(size: usize) -> (Self::PType, Self::CType);
+}
+
+trait MultiProducer<T> {
+    fn append(&self, value: T) -> bool;
+}
+
+trait MultiConsumer<T> {
+    fn pop(&self) -> Option<T>;
+}
+
+impl<T, P: ProducerConsumerPolicy> MultiProducer<T> for Producer<T, P> {
+    fn append(&self, value: T) -> bool {
+        self.append(value)
+    }
+}
+
+impl<T, P: ProducerConsumerPolicy> MultiConsumer<T> for Consumer<T, P> {
+    fn pop(&self) -> Option<T> {
+        self.pop()
+    }
 }
 
 struct MPMCType<T> {
@@ -383,12 +403,8 @@ impl<T> QueueType<T> for MPMCType<T> {
 }
 
 struct MPSCType<T> {
-    consumer: UnsafeCell<Consumer<T, MPSCPolicy>>,
-    _m: PhantomData<T>,
+    consumer: Consumer<T, MPSCPolicy>,
 }
-
-unsafe impl<T> Sync for MPSCType<T> {}
-unsafe impl<T> Send for MPSCType<T> {}
 
 impl<T> Clone for MPSCType<T> {
     fn clone(&self) -> Self {
@@ -398,7 +414,7 @@ impl<T> Clone for MPSCType<T> {
 
 impl<T> MultiConsumer<T> for MPSCType<T> {
     fn pop(&self) -> Option<T> {
-        unsafe { (*self.consumer.get()).pop() }
+        self.consumer.pop()
     }
 }
 
@@ -407,24 +423,14 @@ impl<T> QueueType<T> for MPSCType<T> {
     type CType = MPSCType<T>;
 
     fn create(size: usize) -> (Producer<T, MPSCPolicy>, MPSCType<T>) {
-        let (p, c) = VecQueue::<T, MPSCPolicy>::with_capacity(size);
-        (
-            p,
-            MPSCType {
-                consumer: UnsafeCell::new(c),
-                _m: PhantomData,
-            },
-        )
+        let (producer, consumer) = VecQueue::<T, MPSCPolicy>::with_capacity(size);
+        (producer, MPSCType { consumer })
     }
 }
 
 struct SPMCType<T> {
-    producer: UnsafeCell<Producer<T, SPMCPolicy>>,
-    _m: PhantomData<T>,
+    producer: Producer<T, SPMCPolicy>,
 }
-
-unsafe impl<T> Sync for SPMCType<T> {}
-unsafe impl<T> Send for SPMCType<T> {}
 
 impl<T> Clone for SPMCType<T> {
     fn clone(&self) -> Self {
@@ -434,7 +440,7 @@ impl<T> Clone for SPMCType<T> {
 
 impl<T> MultiProducer<T> for SPMCType<T> {
     fn append(&self, value: T) -> bool {
-        unsafe { (*self.producer.get()).append(value) }
+        self.producer.append(value)
     }
 }
 
@@ -443,13 +449,7 @@ impl<T> QueueType<T> for SPMCType<T> {
     type CType = Consumer<T, SPMCPolicy>;
 
     fn create(size: usize) -> (SPMCType<T>, Consumer<T, SPMCPolicy>) {
-        let (p, c) = VecQueue::<T, SPMCPolicy>::with_capacity(size);
-        (
-            SPMCType {
-                producer: UnsafeCell::new(p),
-                _m: PhantomData,
-            },
-            c,
-        )
+        let (producer, consumer) = VecQueue::<T, SPMCPolicy>::with_capacity(size);
+        (SPMCType { producer }, consumer)
     }
 }

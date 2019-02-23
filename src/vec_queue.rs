@@ -253,9 +253,10 @@ impl<T, PCPolicy: ProducerConsumerPolicy> VecQueue<T, PCPolicy> {
     }
 }
 
+// TODO: rework with drop_in_place?
 impl<T, P: ProducerConsumerPolicy> Drop for VecQueue<T, P> {
     fn drop(&mut self) {
-        if self.pc_policy.request_len_bound(self.capacity()) == 0 {
+        if !mem::needs_drop::<T>() || (self.pc_policy.request_len_bound(self.capacity())) == 0 {
             return;
         }
 
@@ -274,68 +275,51 @@ unsafe impl<T, P: ProducerConsumerPolicy> Send for VecQueue<T, P> {}
 
 // ---
 // implement the (PC-policy dependent) possibilities for creating a queue
-
-pub trait MultiProducer<T>: Sync + Send + Clone {
-    fn append(&self, value: T) -> bool;
-}
-
-pub trait SingleProducer<T>: Sync + Send {
-    fn append(&mut self, value: T) -> bool;
-}
-
-pub trait MultiConsumer<T>: Sync + Send + Clone {
-    fn pop(&self) -> Option<T>;
-}
-
-pub trait SingleConsumer<T>: Sync + Send {
-    fn pop(&mut self) -> Option<T>;
-}
+// semantics are based on the std::sync::mpsc::channel semantics for Sender/Receiver
 
 pub struct Producer<T, PCPolicy: ProducerConsumerPolicy> {
     ptr: Arc<VecQueue<T, PCPolicy>>,
+    _not_sync: PhantomData<*const ()>,
 }
+
+impl<T, P: ProducerConsumerPolicy> Producer<T, P> {
+    pub fn append(&self, value: T) -> bool {
+        self.ptr.append(value)
+    }
+}
+
+//impl<T, P: ProducerConsumerPolicy> !Sync for Producer<T, P> {}
+unsafe impl<T, P: ProducerConsumerPolicy> Send for Producer<T, P> {}
 
 impl<T> Clone for Producer<T, MPSCPolicy> {
     fn clone(&self) -> Self {
         Producer {
             ptr: self.ptr.clone(),
+            _not_sync: PhantomData,
         }
-    }
-}
-
-impl<T> MultiProducer<T> for Producer<T, MPSCPolicy> {
-    fn append(&self, value: T) -> bool {
-        self.ptr.append(value)
-    }
-}
-
-impl<T> SingleProducer<T> for Producer<T, SPMCPolicy> {
-    fn append(&mut self, value: T) -> bool {
-        self.ptr.append(value)
     }
 }
 
 pub struct Consumer<T, PCPolicy: ProducerConsumerPolicy> {
     ptr: Arc<VecQueue<T, PCPolicy>>,
+    _not_sync: PhantomData<*const ()>,
 }
+
+impl<T, P: ProducerConsumerPolicy> Consumer<T, P> {
+    pub fn pop(&self) -> Option<T> {
+        self.ptr.pop()
+    }
+}
+
+//impl<T, P: ProducerConsumerPolicy> !Sync for Consumer<T, P> {}
+unsafe impl<T, P: ProducerConsumerPolicy> Send for Consumer<T, P> {}
 
 impl<T> Clone for Consumer<T, SPMCPolicy> {
     fn clone(&self) -> Self {
         Consumer {
             ptr: self.ptr.clone(),
+            _not_sync: PhantomData,
         }
-    }
-}
-
-impl<T> MultiConsumer<T> for Consumer<T, SPMCPolicy> {
-    fn pop(&self) -> Option<T> {
-        self.ptr.pop()
-    }
-}
-
-impl<T> SingleConsumer<T> for Consumer<T, MPSCPolicy> {
-    fn pop(&mut self) -> Option<T> {
-        self.ptr.pop()
     }
 }
 
@@ -348,14 +332,32 @@ impl<T> VecQueue<T, MPMCPolicy> {
 impl<T> VecQueue<T, MPSCPolicy> {
     pub fn with_capacity(size: usize) -> (Producer<T, MPSCPolicy>, Consumer<T, MPSCPolicy>) {
         let ptr = Arc::new(VecQueue::<T, MPSCPolicy>::new(size));
-        (Producer { ptr: ptr.clone() }, Consumer { ptr })
+        (
+            Producer {
+                ptr: ptr.clone(),
+                _not_sync: PhantomData,
+            },
+            Consumer {
+                ptr,
+                _not_sync: PhantomData,
+            },
+        )
     }
 }
 
 impl<T> VecQueue<T, SPMCPolicy> {
     pub fn with_capacity(size: usize) -> (Producer<T, SPMCPolicy>, Consumer<T, SPMCPolicy>) {
         let ptr = Arc::new(VecQueue::<T, SPMCPolicy>::new(size));
-        (Producer { ptr: ptr.clone() }, Consumer { ptr })
+        (
+            Producer {
+                ptr: ptr.clone(),
+                _not_sync: PhantomData,
+            },
+            Consumer {
+                ptr,
+                _not_sync: PhantomData,
+            },
+        )
     }
 }
 
