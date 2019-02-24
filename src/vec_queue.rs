@@ -158,19 +158,41 @@ pub trait ProducerConsumerPolicy {
     fn empty_decrease_hint(&self);
 }
 
+// the policy set for handling exceeded capacity
+pub trait SizePolicy: Sized {
+    type AppendReturnType;
+
+    fn new(size: usize) -> Self;
+
+    // returns true or (), usually
+    fn return_success(&self) -> Self::AppendReturnType;
+
+    // returns None if append should continue,
+    // Some(x) if append should immediately return x
+    // if returning, the respective counter is decreased, too
+    fn capacity_exceeded<_T, _P: ProducerConsumerPolicy>(
+        &self,
+        queue: &VecQueue<_T, _P, Self>,
+    ) -> Option<Self::AppendReturnType>;
+
+    // called after size test to enable e.g. reallocation
+    fn invoce_barrier<_T, _P: ProducerConsumerPolicy>(&self, queue: &VecQueue<_T, _P, Self>);
+}
+
 // test with fixed size
-pub struct VecQueue<T, PCPolicy: ProducerConsumerPolicy> {
+pub struct VecQueue<T, PCPolicy: ProducerConsumerPolicy, SPolicy: SizePolicy> {
     //data: Vec<StampedElement<T>>,
     // TODO: not necessarily required to use UnsafeCell (at least with fixed size)?
     data: UnsafeCell<Buffer<StampedElement<T, PCPolicy::Stamp>>>,
     pc_policy: PCPolicy,
+    size_policy: SPolicy,
     start_idx: AtomicUsize,
     end_idx: AtomicUsize,
     _marker: PhantomData<T>,
 }
 
 // TODO: resizing...
-impl<T, PCPolicy: ProducerConsumerPolicy> VecQueue<T, PCPolicy> {
+impl<T, PCPolicy: ProducerConsumerPolicy, SPolicy: SizePolicy> VecQueue<T, PCPolicy, SPolicy> {
     fn at(&self, idx: usize) -> &mut StampedElement<T, PCPolicy::Stamp> {
         unsafe { (*self.data.get()).at(idx) }
     }
@@ -197,6 +219,7 @@ impl<T, PCPolicy: ProducerConsumerPolicy> VecQueue<T, PCPolicy> {
         let queue = VecQueue {
             data: UnsafeCell::new(Buffer::new(size)),
             pc_policy: PCPolicy::new(size),
+            size_policy: SPolicy::new(size),
             start_idx: AtomicUsize::new(size),
             end_idx: AtomicUsize::new(size),
             _marker: PhantomData,
@@ -214,14 +237,20 @@ impl<T, PCPolicy: ProducerConsumerPolicy> VecQueue<T, PCPolicy> {
     }
 
     // TODO: more relaxed Ordering possible?
-    pub fn append(&self, value: T) -> bool {
+    pub fn append(&self, value: T) -> SPolicy::AppendReturnType {
         let len = self.pc_policy.request_len_bound(self.capacity());
 
         // test whether queue is full
         if len >= self.capacity() {
-            self.pc_policy.len_decrease_hint();
-            return false;
+            match self.size_policy.capacity_exceeded(self) {
+                Some(x) => {
+                    self.pc_policy.len_decrease_hint();
+                    return x;
+                }
+                None => {}
+            }
         }
+        self.size_policy.invoce_barrier(self);
 
         let (idx, stamp) = Self::increase_idx(&self.end_idx, self.capacity(), true);
 
@@ -230,7 +259,7 @@ impl<T, PCPolicy: ProducerConsumerPolicy> VecQueue<T, PCPolicy> {
         self.at(idx).set_stamp(stamp);
 
         self.pc_policy.empty_decrease_hint();
-        return true;
+        return self.size_policy.return_success();
     }
 
     pub fn pop(&self) -> Option<T> {
@@ -241,6 +270,7 @@ impl<T, PCPolicy: ProducerConsumerPolicy> VecQueue<T, PCPolicy> {
             self.pc_policy.empty_decrease_hint();
             return None;
         }
+        self.size_policy.invoce_barrier(self);
 
         let (idx, stamp) = Self::increase_idx(&self.start_idx, self.capacity(), false);
 
@@ -254,7 +284,7 @@ impl<T, PCPolicy: ProducerConsumerPolicy> VecQueue<T, PCPolicy> {
 }
 
 // TODO: rework with drop_in_place?
-impl<T, P: ProducerConsumerPolicy> Drop for VecQueue<T, P> {
+impl<T, P: ProducerConsumerPolicy, S: SizePolicy> Drop for VecQueue<T, P, S> {
     fn drop(&mut self) {
         if !mem::needs_drop::<T>() || (self.pc_policy.request_len_bound(self.capacity())) == 0 {
             return;
@@ -270,28 +300,28 @@ impl<T, P: ProducerConsumerPolicy> Drop for VecQueue<T, P> {
     }
 }
 
-unsafe impl<T, P: ProducerConsumerPolicy> Sync for VecQueue<T, P> {}
-unsafe impl<T, P: ProducerConsumerPolicy> Send for VecQueue<T, P> {}
+unsafe impl<T, P: ProducerConsumerPolicy, S: SizePolicy> Sync for VecQueue<T, P, S> {}
+unsafe impl<T, P: ProducerConsumerPolicy, S: SizePolicy> Send for VecQueue<T, P, S> {}
 
 // ---
 // implement the (PC-policy dependent) possibilities for creating a queue
 // semantics are based on the std::sync::mpsc::channel semantics for Sender/Receiver
 
-pub struct Producer<T, PCPolicy: ProducerConsumerPolicy> {
-    ptr: Arc<VecQueue<T, PCPolicy>>,
+pub struct Producer<T, PCPolicy: ProducerConsumerPolicy, SPolicy: SizePolicy> {
+    ptr: Arc<VecQueue<T, PCPolicy, SPolicy>>,
     _not_sync: PhantomData<*const ()>,
 }
 
-impl<T, P: ProducerConsumerPolicy> Producer<T, P> {
-    pub fn append(&self, value: T) -> bool {
+impl<T, P: ProducerConsumerPolicy, S: SizePolicy> Producer<T, P, S> {
+    pub fn append(&self, value: T) -> S::AppendReturnType {
         self.ptr.append(value)
     }
 }
 
 //impl<T, P: ProducerConsumerPolicy> !Sync for Producer<T, P> {}
-unsafe impl<T, P: ProducerConsumerPolicy> Send for Producer<T, P> {}
+unsafe impl<T, P: ProducerConsumerPolicy, S: SizePolicy> Send for Producer<T, P, S> {}
 
-impl<T> Clone for Producer<T, MPSCPolicy> {
+impl<T, S: SizePolicy> Clone for Producer<T, MPSCPolicy, S> {
     fn clone(&self) -> Self {
         Producer {
             ptr: self.ptr.clone(),
@@ -300,21 +330,21 @@ impl<T> Clone for Producer<T, MPSCPolicy> {
     }
 }
 
-pub struct Consumer<T, PCPolicy: ProducerConsumerPolicy> {
-    ptr: Arc<VecQueue<T, PCPolicy>>,
+pub struct Consumer<T, PCPolicy: ProducerConsumerPolicy, SPolicy: SizePolicy> {
+    ptr: Arc<VecQueue<T, PCPolicy, SPolicy>>,
     _not_sync: PhantomData<*const ()>,
 }
 
-impl<T, P: ProducerConsumerPolicy> Consumer<T, P> {
+impl<T, P: ProducerConsumerPolicy, S: SizePolicy> Consumer<T, P, S> {
     pub fn pop(&self) -> Option<T> {
         self.ptr.pop()
     }
 }
 
 //impl<T, P: ProducerConsumerPolicy> !Sync for Consumer<T, P> {}
-unsafe impl<T, P: ProducerConsumerPolicy> Send for Consumer<T, P> {}
+unsafe impl<T, P: ProducerConsumerPolicy, S: SizePolicy> Send for Consumer<T, P, S> {}
 
-impl<T> Clone for Consumer<T, SPMCPolicy> {
+impl<T, S: SizePolicy> Clone for Consumer<T, SPMCPolicy, S> {
     fn clone(&self) -> Self {
         Consumer {
             ptr: self.ptr.clone(),
@@ -323,15 +353,15 @@ impl<T> Clone for Consumer<T, SPMCPolicy> {
     }
 }
 
-impl<T> VecQueue<T, MPMCPolicy> {
-    pub fn with_capacity(size: usize) -> VecQueue<T, MPMCPolicy> {
+impl<T, S: SizePolicy> VecQueue<T, MPMCPolicy, S> {
+    pub fn with_capacity(size: usize) -> VecQueue<T, MPMCPolicy, S> {
         VecQueue::new(size)
     }
 }
 
-impl<T> VecQueue<T, MPSCPolicy> {
-    pub fn with_capacity(size: usize) -> (Producer<T, MPSCPolicy>, Consumer<T, MPSCPolicy>) {
-        let ptr = Arc::new(VecQueue::<T, MPSCPolicy>::new(size));
+impl<T, S: SizePolicy> VecQueue<T, MPSCPolicy, S> {
+    pub fn with_capacity(size: usize) -> (Producer<T, MPSCPolicy, S>, Consumer<T, MPSCPolicy, S>) {
+        let ptr = Arc::new(VecQueue::<T, MPSCPolicy, S>::new(size));
         (
             Producer {
                 ptr: ptr.clone(),
@@ -345,9 +375,9 @@ impl<T> VecQueue<T, MPSCPolicy> {
     }
 }
 
-impl<T> VecQueue<T, SPMCPolicy> {
-    pub fn with_capacity(size: usize) -> (Producer<T, SPMCPolicy>, Consumer<T, SPMCPolicy>) {
-        let ptr = Arc::new(VecQueue::<T, SPMCPolicy>::new(size));
+impl<T, S: SizePolicy> VecQueue<T, SPMCPolicy, S> {
+    pub fn with_capacity(size: usize) -> (Producer<T, SPMCPolicy, S>, Consumer<T, SPMCPolicy, S>) {
+        let ptr = Arc::new(VecQueue::<T, SPMCPolicy, S>::new(size));
         (
             Producer {
                 ptr: ptr.clone(),
@@ -550,3 +580,30 @@ impl ProducerConsumerPolicy for SPMCPolicy {
         self.empty.fetch_sub(1, Ordering::SeqCst);
     }
 }
+
+// fixed size policy
+// does effectively nothing (other then cancelling append)
+pub struct FixedSizePolicy {}
+
+impl SizePolicy for FixedSizePolicy {
+    type AppendReturnType = bool;
+
+    fn new(_size: usize) -> Self {
+        FixedSizePolicy {}
+    }
+
+    fn return_success(&self) -> bool {
+        true
+    }
+
+    fn capacity_exceeded<_T, _P: ProducerConsumerPolicy>(
+        &self,
+        _queue: &VecQueue<_T, _P, Self>,
+    ) -> Option<bool> {
+        Some(false)
+    }
+
+    fn invoce_barrier<_T, _P: ProducerConsumerPolicy>(&self, _queue: &VecQueue<_T, _P, Self>) {}
+}
+
+// TODO: ReallocationPolicy

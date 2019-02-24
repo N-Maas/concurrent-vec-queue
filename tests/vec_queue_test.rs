@@ -77,7 +77,7 @@ fn basic_sequential_test_template<QType: QueueType<usize>>() {
 }
 
 // primarily tests correct parallel semantics (e.g. Sync & Send)
-fn basic_parallel_test_template<QType: 'static + QueueType<usize>>() {
+fn basic_parallel_test_template<QType: QueueType<usize>>() {
     let (prod, con) = QType::create(5);
 
     let handle = thread::spawn(move || {
@@ -113,7 +113,7 @@ fn drop_test_template<QType: QueueType<DropCounter>>() {
 }
 
 // use very small size and high throughput to make the test as hard as possible
-fn single_producer_single_consumer_test_template<QType: 'static + QueueType<(usize, usize)>>(
+fn single_producer_single_consumer_test_template<QType: QueueType<(usize, usize)>>(
     size: usize,
     val_count: usize,
 ) {
@@ -147,7 +147,7 @@ fn single_producer_single_consumer_test_template<QType: 'static + QueueType<(usi
         .assert_contained(results.iter());
 }
 
-fn multi_producer_multi_consumer_test_template<QType: 'static + QueueType<(usize, usize)>>(
+fn multi_producer_multi_consumer_test_template<QType: QueueType<(usize, usize)>>(
     size: usize,
     val_count_per_thread: usize,
     producer_count: usize,
@@ -339,9 +339,10 @@ impl Drop for DropCounter {
 // structs for handling different queues uniformly
 // illegal clone is handled by panicking
 // - is this really safe?
+// TODO: different size policies
 trait QueueType<T> {
-    type PType: MultiProducer<T> + Clone + Send;
-    type CType: MultiConsumer<T> + Clone + Send;
+    type PType: MultiProducer<T> + Clone + Send + 'static;
+    type CType: MultiConsumer<T> + Clone + Send + 'static;
 
     fn create(size: usize) -> (Self::PType, Self::CType);
 }
@@ -354,20 +355,20 @@ trait MultiConsumer<T> {
     fn pop(&self) -> Option<T>;
 }
 
-impl<T, P: ProducerConsumerPolicy> MultiProducer<T> for Producer<T, P> {
+impl<T, P: ProducerConsumerPolicy> MultiProducer<T> for Producer<T, P, FixedSizePolicy> {
     fn append(&self, value: T) -> bool {
         self.append(value)
     }
 }
 
-impl<T, P: ProducerConsumerPolicy> MultiConsumer<T> for Consumer<T, P> {
+impl<T, P: ProducerConsumerPolicy, S: SizePolicy> MultiConsumer<T> for Consumer<T, P, S> {
     fn pop(&self) -> Option<T> {
         self.pop()
     }
 }
 
 struct MPMCType<T> {
-    queue: Arc<VecQueue<T, MPMCPolicy>>,
+    queue: Arc<VecQueue<T, MPMCPolicy, FixedSizePolicy>>,
 }
 
 impl<T> Clone for MPMCType<T> {
@@ -390,20 +391,22 @@ impl<T> MultiConsumer<T> for MPMCType<T> {
     }
 }
 
-impl<T> QueueType<T> for MPMCType<T> {
+impl<T: 'static> QueueType<T> for MPMCType<T> {
     type PType = MPMCType<T>;
     type CType = MPMCType<T>;
 
     fn create(size: usize) -> (MPMCType<T>, MPMCType<T>) {
         let queue_w = MPMCType {
-            queue: Arc::new(VecQueue::<T, MPMCPolicy>::with_capacity(size)),
+            queue: Arc::new(VecQueue::<T, MPMCPolicy, FixedSizePolicy>::with_capacity(
+                size,
+            )),
         };
         (queue_w.clone(), queue_w)
     }
 }
 
 struct MPSCType<T> {
-    consumer: Consumer<T, MPSCPolicy>,
+    consumer: Consumer<T, MPSCPolicy, FixedSizePolicy>,
 }
 
 impl<T> Clone for MPSCType<T> {
@@ -418,18 +421,18 @@ impl<T> MultiConsumer<T> for MPSCType<T> {
     }
 }
 
-impl<T> QueueType<T> for MPSCType<T> {
-    type PType = Producer<T, MPSCPolicy>;
+impl<T: 'static> QueueType<T> for MPSCType<T> {
+    type PType = Producer<T, MPSCPolicy, FixedSizePolicy>;
     type CType = MPSCType<T>;
 
-    fn create(size: usize) -> (Producer<T, MPSCPolicy>, MPSCType<T>) {
-        let (producer, consumer) = VecQueue::<T, MPSCPolicy>::with_capacity(size);
+    fn create(size: usize) -> (Producer<T, MPSCPolicy, FixedSizePolicy>, MPSCType<T>) {
+        let (producer, consumer) = VecQueue::<T, MPSCPolicy, FixedSizePolicy>::with_capacity(size);
         (producer, MPSCType { consumer })
     }
 }
 
 struct SPMCType<T> {
-    producer: Producer<T, SPMCPolicy>,
+    producer: Producer<T, SPMCPolicy, FixedSizePolicy>,
 }
 
 impl<T> Clone for SPMCType<T> {
@@ -444,12 +447,12 @@ impl<T> MultiProducer<T> for SPMCType<T> {
     }
 }
 
-impl<T> QueueType<T> for SPMCType<T> {
+impl<T: 'static> QueueType<T> for SPMCType<T> {
     type PType = SPMCType<T>;
-    type CType = Consumer<T, SPMCPolicy>;
+    type CType = Consumer<T, SPMCPolicy, FixedSizePolicy>;
 
-    fn create(size: usize) -> (SPMCType<T>, Consumer<T, SPMCPolicy>) {
-        let (producer, consumer) = VecQueue::<T, SPMCPolicy>::with_capacity(size);
+    fn create(size: usize) -> (SPMCType<T>, Consumer<T, SPMCPolicy, FixedSizePolicy>) {
+        let (producer, consumer) = VecQueue::<T, SPMCPolicy, FixedSizePolicy>::with_capacity(size);
         (SPMCType { producer }, consumer)
     }
 }
