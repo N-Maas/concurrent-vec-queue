@@ -1,8 +1,9 @@
+use std::boxed::Box;
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 use std::mem;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -85,7 +86,6 @@ impl<T, S: AtomicStamp> StampedElement<T, S> {
 //}
 
 // fixed size buffer holding elements
-// TODO: volatile read/write for capacity/ptr necessary when moving?!
 struct Buffer<T> {
     ptr: *mut T,
     capacity: usize,
@@ -125,13 +125,12 @@ impl<T> Drop for Buffer<T> {
     }
 }
 
-// TODO: different read/write access to non-MPMC-queues
 // the policy set for creating different queue types
 // concerning alllowed producer/consumer count, fixed or dynamic size, ...
+
+// policy for handling stamps, depending on producer/consumer count
 pub trait ProducerConsumerPolicy {
     type Stamp: AtomicStamp;
-
-    fn new(size: usize) -> Self;
 
     // returns the fitting stamp for the index (without modulo)
     fn to_stamp(idx: usize, is_write: bool) -> <Self::Stamp as AtomicStamp>::Value;
@@ -147,18 +146,9 @@ pub trait ProducerConsumerPolicy {
         cap: usize,
         requested: <Self::Stamp as AtomicStamp>::Value,
     );
-
-    // request an upper bound, possibly (depending on policy) increasing it
-    fn request_len_bound(&self, cap: usize) -> usize;
-    fn request_empty_bound(&self, cap: usize) -> usize;
-
-    // hint, that the according value should be decreased
-    // might do nothing, depending on the policy
-    fn len_decrease_hint(&self);
-    fn empty_decrease_hint(&self);
 }
 
-// the policy set for handling exceeded capacity
+// policy for handling exceeded capacity
 pub trait SizePolicy: Sized {
     type AppendReturnType;
 
@@ -184,14 +174,14 @@ pub struct VecQueue<T, PCPolicy: ProducerConsumerPolicy, SPolicy: SizePolicy> {
     //data: Vec<StampedElement<T>>,
     // TODO: not necessarily required to use UnsafeCell (at least with fixed size)?
     data: UnsafeCell<Buffer<StampedElement<T, PCPolicy::Stamp>>>,
-    pc_policy: PCPolicy,
     size_policy: SPolicy,
+    empty: AtomicUsize,
+    len: AtomicUsize,
     start_idx: AtomicUsize,
     end_idx: AtomicUsize,
     _marker: PhantomData<T>,
 }
 
-// TODO: resizing...
 impl<T, PCPolicy: ProducerConsumerPolicy, SPolicy: SizePolicy> VecQueue<T, PCPolicy, SPolicy> {
     fn at(&self, idx: usize) -> &mut StampedElement<T, PCPolicy::Stamp> {
         unsafe { (*self.data.get()).at(idx) }
@@ -211,6 +201,7 @@ impl<T, PCPolicy: ProducerConsumerPolicy, SPolicy: SizePolicy> VecQueue<T, PCPol
     }
 
     // size is always a power of two
+    // specifically, a size of zero is not possible, but is increased to 1
     fn new(size: usize) -> Self {
         // TODO: isize::max_value() + 1 should be legal? (may cause problems with stamp calculations?)
         assert!(size <= isize::max_value() as usize);
@@ -218,8 +209,9 @@ impl<T, PCPolicy: ProducerConsumerPolicy, SPolicy: SizePolicy> VecQueue<T, PCPol
 
         let queue = VecQueue {
             data: UnsafeCell::new(Buffer::new(size)),
-            pc_policy: PCPolicy::new(size),
             size_policy: SPolicy::new(size),
+            empty: AtomicUsize::new(size),
+            len: AtomicUsize::new(0),
             start_idx: AtomicUsize::new(size),
             end_idx: AtomicUsize::new(size),
             _marker: PhantomData,
@@ -227,6 +219,7 @@ impl<T, PCPolicy: ProducerConsumerPolicy, SPolicy: SizePolicy> VecQueue<T, PCPol
         debug_assert!(queue.capacity() == size);
 
         for idx in 0..size {
+            // TODO: atomic operation probably unnecessary?
             queue.at(idx).set_stamp(PCPolicy::to_stamp(idx, false));
         }
         return queue;
@@ -238,16 +231,17 @@ impl<T, PCPolicy: ProducerConsumerPolicy, SPolicy: SizePolicy> VecQueue<T, PCPol
 
     // TODO: more relaxed Ordering possible?
     pub fn append(&self, value: T) -> SPolicy::AppendReturnType {
-        let len = self.pc_policy.request_len_bound(self.capacity());
+        let len = self.len.fetch_add(1, Ordering::SeqCst);
 
         // test whether queue is full
-        if len >= self.capacity() {
+        // TODO: loop necessary?
+        while len >= self.capacity() {
             match self.size_policy.capacity_exceeded(self) {
                 Some(x) => {
-                    self.pc_policy.len_decrease_hint();
+                    self.len.fetch_sub(1, Ordering::SeqCst);
                     return x;
                 }
-                None => {}
+                None => {println!("CAP LOOP");}
             }
         }
         self.size_policy.invoce_barrier(self);
@@ -258,16 +252,16 @@ impl<T, PCPolicy: ProducerConsumerPolicy, SPolicy: SizePolicy> VecQueue<T, PCPol
         self.at(idx).write(value);
         self.at(idx).set_stamp(stamp);
 
-        self.pc_policy.empty_decrease_hint();
+        self.empty.fetch_sub(1, Ordering::SeqCst);
         return self.size_policy.return_success();
     }
 
     pub fn pop(&self) -> Option<T> {
-        let empty = self.pc_policy.request_empty_bound(self.capacity());
+        let empty = self.empty.fetch_add(1, Ordering::SeqCst);
 
         // test whether queue is empty
         if empty >= self.capacity() {
-            self.pc_policy.empty_decrease_hint();
+            self.empty.fetch_sub(1, Ordering::SeqCst);
             return None;
         }
         self.size_policy.invoce_barrier(self);
@@ -278,7 +272,7 @@ impl<T, PCPolicy: ProducerConsumerPolicy, SPolicy: SizePolicy> VecQueue<T, PCPol
         let val = self.at(idx).read();
         self.at(idx).set_stamp(stamp);
 
-        self.pc_policy.len_decrease_hint();
+        self.len.fetch_sub(1, Ordering::SeqCst);
         return Some(val);
     }
 }
@@ -286,7 +280,7 @@ impl<T, PCPolicy: ProducerConsumerPolicy, SPolicy: SizePolicy> VecQueue<T, PCPol
 // TODO: rework with drop_in_place?
 impl<T, P: ProducerConsumerPolicy, S: SizePolicy> Drop for VecQueue<T, P, S> {
     fn drop(&mut self) {
-        if !mem::needs_drop::<T>() || (self.pc_policy.request_len_bound(self.capacity())) == 0 {
+        if !mem::needs_drop::<T>() || self.len.load(Ordering::SeqCst) == 0 {
             return;
         }
 
@@ -395,20 +389,10 @@ impl<T, S: SizePolicy> VecQueue<T, SPMCPolicy, S> {
 // implement the policies
 
 // multiple producer/multiple consumer policy
-pub struct MPMCPolicy {
-    empty: AtomicUsize,
-    len: AtomicUsize,
-}
+pub struct MPMCPolicy {}
 
 impl ProducerConsumerPolicy for MPMCPolicy {
     type Stamp = AtomicIsize;
-
-    fn new(size: usize) -> Self {
-        MPMCPolicy {
-            empty: AtomicUsize::new(size),
-            len: AtomicUsize::new(0),
-        }
-    }
 
     fn to_stamp(idx: usize, is_write: bool) -> isize {
         // wrapped overflow should function correctly here
@@ -425,6 +409,11 @@ impl ProducerConsumerPolicy for MPMCPolicy {
         debug_assert!(cap <= isize::max_value() as usize);
 
         while !(el.get_stamp() == (cap as isize) - requested) {
+            // println!(
+            //     "WRITE LOOP, stamp: {:?}, expected: {:?}",
+            //     el.get_stamp(),
+            //     (cap as isize) - requested
+            // );
             thread::yield_now();
         }
     }
@@ -435,41 +424,21 @@ impl ProducerConsumerPolicy for MPMCPolicy {
         requested: isize,
     ) {
         while !(el.get_stamp() == -requested) {
+            // println!(
+            //     "READ LOOP, stamp: {:?}, expected: {:?}",
+            //     el.get_stamp(),
+            //     -requested
+            // );
             thread::yield_now();
         }
-    }
-
-    // request an upper bound, increasing it
-    fn request_len_bound(&self, _cap: usize) -> usize {
-        self.len.fetch_add(1, Ordering::SeqCst)
-    }
-
-    fn request_empty_bound(&self, _cap: usize) -> usize {
-        self.empty.fetch_add(1, Ordering::SeqCst)
-    }
-
-    fn len_decrease_hint(&self) {
-        self.len.fetch_sub(1, Ordering::SeqCst);
-    }
-
-    fn empty_decrease_hint(&self) {
-        self.empty.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
 // multiple producer/single consumer policy
-pub struct MPSCPolicy {
-    len: AtomicUsize,
-}
+pub struct MPSCPolicy {}
 
 impl ProducerConsumerPolicy for MPSCPolicy {
     type Stamp = AtomicBool;
-
-    fn new(_size: usize) -> Self {
-        MPSCPolicy {
-            len: AtomicUsize::new(0),
-        }
-    }
 
     fn to_stamp(_idx: usize, is_write: bool) -> bool {
         is_write
@@ -495,43 +464,13 @@ impl ProducerConsumerPolicy for MPSCPolicy {
             thread::yield_now();
         }
     }
-
-    fn request_len_bound(&self, _cap: usize) -> usize {
-        self.len.fetch_add(1, Ordering::SeqCst)
-    }
-
-    // with only one consumer, empty can be calculated using len
-    // len might temporarily be higher then the capacity
-    fn request_empty_bound(&self, cap: usize) -> usize {
-        let len = self.len.load(Ordering::SeqCst);
-
-        if len < cap {
-            cap - len
-        } else {
-            0
-        }
-    }
-
-    fn len_decrease_hint(&self) {
-        self.len.fetch_sub(1, Ordering::SeqCst);
-    }
-
-    fn empty_decrease_hint(&self) {}
 }
 
 // single producer/multiple consumer policy
-pub struct SPMCPolicy {
-    empty: AtomicUsize,
-}
+pub struct SPMCPolicy {}
 
 impl ProducerConsumerPolicy for SPMCPolicy {
     type Stamp = AtomicBool;
-
-    fn new(size: usize) -> Self {
-        SPMCPolicy {
-            empty: AtomicUsize::new(size),
-        }
-    }
 
     fn to_stamp(_idx: usize, is_write: bool) -> bool {
         is_write
@@ -556,28 +495,6 @@ impl ProducerConsumerPolicy for SPMCPolicy {
         requested: bool,
     ) {
         debug_assert!(!requested);
-    }
-
-    // with only one producer, len can be calculated using empty
-    // empty might temporarily be higher then the capacity
-    fn request_len_bound(&self, cap: usize) -> usize {
-        let empty = self.empty.load(Ordering::SeqCst);
-
-        if empty < cap {
-            cap - empty
-        } else {
-            0
-        }
-    }
-
-    fn request_empty_bound(&self, _cap: usize) -> usize {
-        self.empty.fetch_add(1, Ordering::SeqCst)
-    }
-
-    fn len_decrease_hint(&self) {}
-
-    fn empty_decrease_hint(&self) {
-        self.empty.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -606,4 +523,278 @@ impl SizePolicy for FixedSizePolicy {
     fn invoce_barrier<_T, _P: ProducerConsumerPolicy>(&self, _queue: &VecQueue<_T, _P, Self>) {}
 }
 
-// TODO: ReallocationPolicy
+// reallocation policy
+const COPY_BLOCK_SIZE: usize = 255;
+const THREAD_COUNT_MASK: usize = isize::max_value() as usize;
+const LOCK_MASK: usize = THREAD_COUNT_MASK + 1;
+
+fn is_locked(l_and_count: usize) -> bool {
+    (l_and_count & LOCK_MASK) != 0
+}
+
+fn to_thread_count(l_and_count: usize) -> usize {
+    l_and_count & THREAD_COUNT_MASK
+}
+
+// temporarily for reallocation needed (heap allocated) data
+pub struct ReallocationData<T, S: AtomicStamp> {
+    new_buffer: Buffer<StampedElement<T, S>>,
+    start_flag: AtomicBool,
+    copy_idx: AtomicUsize,
+}
+
+pub struct ReallocationPolicy {
+    lock_and_t_count: AtomicUsize,
+    // must be casted to correct type
+    ra_ptr: AtomicPtr<()>,
+}
+
+impl ReallocationPolicy {
+    // help copying the data, but only if the thread_count could be increased successfully
+    fn try_join<_T, _P: ProducerConsumerPolicy>(
+        &self,
+        queue: &VecQueue<_T, _P, Self>,
+        lock: usize,
+    ) -> Option<()> {
+        debug_assert!(is_locked(lock));
+        let mut result = Err(lock);
+
+        loop {
+            println!("WAIT TRY JOIN");
+            match result {
+                Ok(_) => {
+                    println!("-> t_count increased <-");
+                    return self.join_copying(queue);
+                }
+                Err(val) => {
+                    // if not locked anymore, return
+                    if !is_locked(val) {
+                        return None;
+                    }
+                    // if thread count is 0, the work is nearly done already
+                    if to_thread_count(val) == 0 {
+                        return self.await_completion();
+                    }
+                    // else: try increase the thread count
+                    result = self.lock_and_t_count.compare_exchange_weak(
+                        val,
+                        val + 1,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    );
+                }
+            }
+        }
+    }
+
+    // help copying the data, as soon as a stable state is reached
+    fn join_copying<T, P: ProducerConsumerPolicy>(
+        &self,
+        queue: &VecQueue<T, P, Self>,
+    ) -> Option<()> {
+        debug_assert!(is_locked(self.lock_and_t_count.load(Ordering::SeqCst)));
+
+        // first, wait for ra_ptr to be initialized
+        let realloc_data: &ReallocationData<T, P::Stamp> = {
+            loop {
+                println!("WAIT FOR PTR");
+                let p = self.ra_ptr.load(Ordering::SeqCst);
+                if p != ptr::null_mut() {
+                    break unsafe { &*(p as *mut ReallocationData<T, P::Stamp>) };
+                }
+                thread::yield_now();
+            }
+        };
+
+        // wait for start_flag, indicating a stable state
+        println!("--- WAIT FOR START ---");
+        while !realloc_data.start_flag.load(Ordering::SeqCst) {
+            debug_assert!(self.ra_ptr.load(Ordering::SeqCst) != ptr::null_mut());
+            debug_assert!(is_locked(self.lock_and_t_count.load(Ordering::SeqCst)));
+
+            // thread count can't decrease in this phase, so this results in a pessimistic estimate
+            let t_count = to_thread_count(self.lock_and_t_count.load(Ordering::SeqCst));
+            let bias = queue.len.load(Ordering::SeqCst) + queue.empty.load(Ordering::SeqCst)
+                - queue.capacity();
+            debug_assert!(bias >= t_count);
+
+            // if bias == thread count, no thread is behind the barrier anymore and a stable state is reached
+            if bias == t_count {
+                realloc_data.start_flag.store(true, Ordering::SeqCst);
+                break;
+            }
+            //println!(
+            //    "len: {:?}, empty: {:?}, bias: {:?}, t_count: {:?}",
+            //    queue.len.load(Ordering::SeqCst),
+            //    queue.empty.load(Ordering::SeqCst),
+            //    bias,
+            //    t_count
+            //);
+            thread::yield_now();
+        }
+        println!("--- SUCCESS ---");
+
+        Self::copy_data(realloc_data, queue);
+
+        // if this is the last arriving thread, invoke finalize (for this thread only!)
+        if to_thread_count(self.lock_and_t_count.fetch_sub(1, Ordering::SeqCst)) == 1 {
+            return self.finalize(queue);
+        }
+        self.await_completion()
+    }
+
+    // must be called only by one thread per reallocation, performs the final steps
+    fn copy_data<T, P: ProducerConsumerPolicy>(
+        realloc: &ReallocationData<T, P::Stamp>,
+        queue: &VecQueue<T, P, Self>,
+    ) {
+        let block_size = (COPY_BLOCK_SIZE / mem::size_of::<T>()) + 1;
+        let start_idx = queue.start_idx.load(Ordering::SeqCst);
+        let end_idx = queue.end_idx.load(Ordering::SeqCst);
+        let new_cap = realloc.new_buffer.capacity();
+        let old_cap = queue.capacity();
+
+        loop {
+            let start = realloc.copy_idx.fetch_add(block_size, Ordering::SeqCst);
+            if start >= new_cap {
+                break;
+            }
+
+            //println!("LOOP START");
+            println!(
+                "old_cap: {:?}, new_cap: {:?}, block_size: {:?}, start: {:?}",
+                old_cap, new_cap, block_size, start
+            );
+            for i in start..usize::min(start + block_size, new_cap) {
+                let q_idx = start_idx + i;
+                //println!("i: {:?}, q_idx: {:?}", i, q_idx);
+                let el = &mut realloc.new_buffer.at(i);
+                // TODO: remove this line
+                el.set_stamp(P::to_stamp(q_idx, false));
+                if q_idx < end_idx {
+                    el.write(queue.at(q_idx & (old_cap - 1)).read());
+                    el.set_stamp(P::to_stamp(i + new_cap, true));
+                } else {
+                    el.set_stamp(P::to_stamp(i, false));
+                }
+            }
+            //println!("LOOP END");
+        }
+
+        debug_assert!(start_idx == queue.start_idx.load(Ordering::SeqCst));
+        debug_assert!(end_idx == queue.end_idx.load(Ordering::SeqCst));
+    }
+
+    // must be called only by one thread per reallocation, performs the final steps
+    fn finalize<T, P: ProducerConsumerPolicy>(&self, queue: &VecQueue<T, P, Self>) -> Option<()> {
+        println!("FINALIZE START");
+        debug_assert!(self.lock_and_t_count.load(Ordering::SeqCst) == LOCK_MASK);
+
+        let realloc_ptr = self.ra_ptr.load(Ordering::SeqCst) as *mut ReallocationData<T, P::Stamp>;
+        // exchange buffers and drop the ReallocationData
+        unsafe {
+            ptr::swap(queue.data.get(), &mut (*realloc_ptr).new_buffer);
+            ptr::drop_in_place(realloc_ptr);
+        }
+        self.ra_ptr.store(ptr::null_mut(), Ordering::SeqCst);
+
+        // reset indizes (start_idx is reset to capacity)
+        // and increase empty count by capacity / 2
+        let diff = queue.end_idx.load(Ordering::SeqCst) - queue.start_idx.load(Ordering::SeqCst);
+        let cap = queue.capacity();
+        queue.start_idx.store(cap, Ordering::SeqCst);
+        queue.end_idx.store(cap + diff, Ordering::SeqCst);
+        queue.empty.fetch_add(cap >> 1, Ordering::SeqCst);
+
+        debug_assert!((diff == 0) || queue.at(diff - 1).is_valid());
+        debug_assert!(!queue.at(diff).is_valid());
+
+        // unlock, now business as usual can continue
+        self.lock_and_t_count.store(0, Ordering::SeqCst);
+        println!("FINALIZE END");
+        None
+    }
+
+    // waits until the lock is released
+    fn await_completion(&self) -> Option<()> {
+        println!("--- AWAIT COMPLETION ---");
+        while is_locked(self.lock_and_t_count.load(Ordering::SeqCst)) {
+            // TODO: this is erronous
+            // a thread might be preempted in the loop while the lock is unlocked
+            // and locked again, causing an incorrect bias
+            // (because this thread does not add to t_count)
+            thread::yield_now();
+        }
+        println!("--- COMPLETED ---");
+        None
+    }
+}
+
+impl SizePolicy for ReallocationPolicy {
+    type AppendReturnType = ();
+
+    fn new(_size: usize) -> Self {
+        ReallocationPolicy {
+            lock_and_t_count: AtomicUsize::new(0),
+            ra_ptr: AtomicPtr::new(ptr::null_mut()),
+        }
+    }
+
+    fn return_success(&self) {
+        ()
+    }
+
+    // try init the lock
+    fn capacity_exceeded<T, P: ProducerConsumerPolicy>(
+        &self,
+        queue: &VecQueue<T, P, Self>,
+    ) -> Option<()> {
+        let mut lock = 0;
+
+        loop {
+            // try set lock to true and thread_count to 1
+            match self.lock_and_t_count.compare_exchange_weak(
+                lock,
+                LOCK_MASK + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    // TODO remove assert
+                    debug_assert!(to_thread_count(self.lock_and_t_count.load(Ordering::SeqCst)) > 0);
+                    // init the reallocation data
+                    debug_assert!(self.ra_ptr.load(Ordering::SeqCst) == ptr::null_mut());
+
+                    let init_data = Box::new(ReallocationData::<T, P::Stamp> {
+                        new_buffer: Buffer::new(2 * queue.capacity()),
+                        start_flag: AtomicBool::new(false),
+                        copy_idx: AtomicUsize::new(0),
+                    });
+                    debug_assert!(init_data.new_buffer.capacity().is_power_of_two());
+
+                    self.ra_ptr
+                        .store(Box::into_raw(init_data) as *mut (), Ordering::SeqCst);
+                    println!("INIT JOIN");
+                    return self.join_copying(queue);
+                }
+
+                Err(val) => {
+                    // if already locked, join the copying
+                    if is_locked(val) {
+                        return self.try_join(queue, val);
+                    }
+                    // else: retry setting the lock
+                    lock = val;
+                }
+            }
+        }
+    }
+
+    fn invoce_barrier<_T, _P: ProducerConsumerPolicy>(&self, queue: &VecQueue<_T, _P, Self>) {
+        let lock = self.lock_and_t_count.load(Ordering::SeqCst);
+        if is_locked(lock) {
+            println!("LOCKED");
+            self.try_join(queue, lock);
+        }
+    }
+}
