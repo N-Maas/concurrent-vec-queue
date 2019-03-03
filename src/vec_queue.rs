@@ -234,14 +234,14 @@ impl<T, PCPolicy: ProducerConsumerPolicy, SPolicy: SizePolicy> VecQueue<T, PCPol
         let len = self.len.fetch_add(1, Ordering::SeqCst);
 
         // test whether queue is full
-        // TODO: loop necessary?
-        while len >= self.capacity() {
+        // TODO: loop necessary? TODO: Seems to fix deadlock???
+        if len >= self.capacity() {
             match self.size_policy.capacity_exceeded(self) {
                 Some(x) => {
                     self.len.fetch_sub(1, Ordering::SeqCst);
                     return x;
                 }
-                None => {println!("CAP LOOP");}
+                None => {}
             }
         }
         self.size_policy.invoce_barrier(self);
@@ -408,14 +408,16 @@ impl ProducerConsumerPolicy for MPMCPolicy {
         debug_assert!(cap.is_power_of_two());
         debug_assert!(cap <= isize::max_value() as usize);
 
+        println!(
+            "WRITE LOOP, stamp: {:?}, expected: {:?}, {:?}",
+            el.get_stamp(),
+            (cap as isize) - requested,
+            thread::current().id()
+        );
         while !(el.get_stamp() == (cap as isize) - requested) {
-            // println!(
-            //     "WRITE LOOP, stamp: {:?}, expected: {:?}",
-            //     el.get_stamp(),
-            //     (cap as isize) - requested
-            // );
             thread::yield_now();
         }
+        println!(">>>WRITE SUCCESS, {:?}", thread::current().id());
     }
 
     fn wait_for_stamp_on_read<_T>(
@@ -423,14 +425,16 @@ impl ProducerConsumerPolicy for MPMCPolicy {
         _cap: usize,
         requested: isize,
     ) {
+        println!(
+            "READ LOOP, stamp: {:?}, expected: {:?}, {:?}",
+            el.get_stamp(),
+            -requested,
+            thread::current().id()
+        );
         while !(el.get_stamp() == -requested) {
-            // println!(
-            //     "READ LOOP, stamp: {:?}, expected: {:?}",
-            //     el.get_stamp(),
-            //     -requested
-            // );
             thread::yield_now();
         }
+        println!(">>>READ SUCCESS, {:?}", thread::current().id());
     }
 }
 
@@ -527,6 +531,7 @@ impl SizePolicy for FixedSizePolicy {
 const COPY_BLOCK_SIZE: usize = 255;
 const THREAD_COUNT_MASK: usize = isize::max_value() as usize;
 const LOCK_MASK: usize = THREAD_COUNT_MASK + 1;
+// const COPY_COUNT_LOCKED: usize = usize::max_value();
 
 fn is_locked(l_and_count: usize) -> bool {
     (l_and_count & LOCK_MASK) != 0
@@ -544,7 +549,10 @@ pub struct ReallocationData<T, S: AtomicStamp> {
 }
 
 pub struct ReallocationPolicy {
+    // synchronizes initial access and completion of all copy tasks
     lock_and_t_count: AtomicUsize,
+    // synchronizes the copying
+    copy_t_count: AtomicUsize,
     // must be casted to correct type
     ra_ptr: AtomicPtr<()>,
 }
@@ -554,31 +562,33 @@ impl ReallocationPolicy {
     fn try_join<_T, _P: ProducerConsumerPolicy>(
         &self,
         queue: &VecQueue<_T, _P, Self>,
-        lock: usize,
     ) -> Option<()> {
-        debug_assert!(is_locked(lock));
-        let mut result = Err(lock);
+        let l_tc = self.lock_and_t_count.fetch_add(1, Ordering::SeqCst);
+        // if not locked anymore, return
+        if !is_locked(l_tc) {
+            self.lock_and_t_count.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
 
+        let mut result = Err(1);
         loop {
-            println!("WAIT TRY JOIN");
+            // println!("WAIT TRY JOIN");
             match result {
                 Ok(_) => {
-                    println!("-> t_count increased <-");
                     return self.join_copying(queue);
                 }
-                Err(val) => {
-                    // if not locked anymore, return
-                    if !is_locked(val) {
-                        return None;
-                    }
+                Err(count) => {
                     // if thread count is 0, the work is nearly done already
-                    if to_thread_count(val) == 0 {
+                    if count == 0 {
+                        // TODO: this could happen at init, too
+                        // - better wait for increased count?
+                        println!("*** COUNT ZERO: {:?} ***", thread::current().id());
                         return self.await_completion();
                     }
                     // else: try increase the thread count
-                    result = self.lock_and_t_count.compare_exchange_weak(
-                        val,
-                        val + 1,
+                    result = self.copy_t_count.compare_exchange(
+                        count,
+                        count + 1,
                         Ordering::SeqCst,
                         Ordering::SeqCst,
                     );
@@ -593,21 +603,39 @@ impl ReallocationPolicy {
         queue: &VecQueue<T, P, Self>,
     ) -> Option<()> {
         debug_assert!(is_locked(self.lock_and_t_count.load(Ordering::SeqCst)));
+        debug_assert!(self.copy_t_count.load(Ordering::SeqCst) > 0);
+        debug_assert!(self.ra_ptr.load(Ordering::SeqCst) != ptr::null_mut());
 
+        // copy_t_count > 0 asserts self.ra_ptr is initialized
+        let realloc_data: &ReallocationData<T, P::Stamp> =
+            unsafe { &*(self.ra_ptr.load(Ordering::SeqCst) as *mut ReallocationData<T, P::Stamp>) };
         // first, wait for ra_ptr to be initialized
-        let realloc_data: &ReallocationData<T, P::Stamp> = {
-            loop {
-                println!("WAIT FOR PTR");
-                let p = self.ra_ptr.load(Ordering::SeqCst);
-                if p != ptr::null_mut() {
-                    break unsafe { &*(p as *mut ReallocationData<T, P::Stamp>) };
-                }
-                thread::yield_now();
-            }
-        };
+        //{
+        //    loop {
+        //        // println!("WAIT FOR PTR");
+        //        let p = self.ra_ptr.load(Ordering::SeqCst);
+        //        if p != ptr::null_mut() {
+        //            break unsafe { &*(p as *mut ReallocationData<T, P::Stamp>) };
+        //        }
+        //        thread::yield_now();
+        //    }
+        //};
 
         // wait for start_flag, indicating a stable state
-        println!("--- WAIT FOR START ---");
+        let len = queue.len.load(Ordering::SeqCst);
+        let empty = queue.empty.load(Ordering::SeqCst);
+        let bias = len + empty - queue.capacity();
+        let t_count = to_thread_count(self.lock_and_t_count.load(Ordering::SeqCst));
+        let copy_cnt = self.copy_t_count.load(Ordering::SeqCst);
+            println!(
+               "len: {:?}, empty: {:?}, bias: {:?}, t_count: {:?}, copy_count: {:?}",
+               len,
+               empty,
+               bias,
+               t_count,
+               copy_cnt
+            );
+        println!("+(1) WAIT FOR START: {:?} - {:?}", thread::current().id(), realloc_data.start_flag.load(Ordering::SeqCst));
         while !realloc_data.start_flag.load(Ordering::SeqCst) {
             debug_assert!(self.ra_ptr.load(Ordering::SeqCst) != ptr::null_mut());
             debug_assert!(is_locked(self.lock_and_t_count.load(Ordering::SeqCst)));
@@ -632,12 +660,12 @@ impl ReallocationPolicy {
             //);
             thread::yield_now();
         }
-        println!("--- SUCCESS ---");
+        println!("-(1) SUCCESS: {:?}", thread::current().id());
 
         Self::copy_data(realloc_data, queue);
 
         // if this is the last arriving thread, invoke finalize (for this thread only!)
-        if to_thread_count(self.lock_and_t_count.fetch_sub(1, Ordering::SeqCst)) == 1 {
+        if to_thread_count(self.copy_t_count.fetch_sub(1, Ordering::SeqCst)) == 1 {
             return self.finalize(queue);
         }
         self.await_completion()
@@ -661,10 +689,10 @@ impl ReallocationPolicy {
             }
 
             //println!("LOOP START");
-            println!(
-                "old_cap: {:?}, new_cap: {:?}, block_size: {:?}, start: {:?}",
-                old_cap, new_cap, block_size, start
-            );
+            //println!(
+            //    "old_cap: {:?}, new_cap: {:?}, block_size: {:?}, start: {:?}",
+            //    old_cap, new_cap, block_size, start
+            //);
             for i in start..usize::min(start + block_size, new_cap) {
                 let q_idx = start_idx + i;
                 //println!("i: {:?}, q_idx: {:?}", i, q_idx);
@@ -687,8 +715,9 @@ impl ReallocationPolicy {
 
     // must be called only by one thread per reallocation, performs the final steps
     fn finalize<T, P: ProducerConsumerPolicy>(&self, queue: &VecQueue<T, P, Self>) -> Option<()> {
-        println!("FINALIZE START");
-        debug_assert!(self.lock_and_t_count.load(Ordering::SeqCst) == LOCK_MASK);
+        println!("*** FINALIZE: {:?} ***", thread::current().id());
+        debug_assert!(is_locked(self.lock_and_t_count.load(Ordering::SeqCst)));
+        debug_assert!(self.copy_t_count.load(Ordering::SeqCst) == 0);
 
         let realloc_ptr = self.ra_ptr.load(Ordering::SeqCst) as *mut ReallocationData<T, P::Stamp>;
         // exchange buffers and drop the ReallocationData
@@ -710,22 +739,23 @@ impl ReallocationPolicy {
         debug_assert!(!queue.at(diff).is_valid());
 
         // unlock, now business as usual can continue
-        self.lock_and_t_count.store(0, Ordering::SeqCst);
-        println!("FINALIZE END");
+        self.lock_and_t_count.fetch_sub(1, Ordering::SeqCst);
+        self.lock_and_t_count
+            .fetch_and(THREAD_COUNT_MASK, Ordering::SeqCst);
+        println!("EXTENDED TO {:?}", cap);
         None
     }
 
     // waits until the lock is released
     fn await_completion(&self) -> Option<()> {
-        println!("--- AWAIT COMPLETION ---");
+        println!("+(2) AWAIT COMPLETION: {:?}", thread::current().id());
         while is_locked(self.lock_and_t_count.load(Ordering::SeqCst)) {
-            // TODO: this is erronous
-            // a thread might be preempted in the loop while the lock is unlocked
-            // and locked again, causing an incorrect bias
-            // (because this thread does not add to t_count)
             thread::yield_now();
         }
-        println!("--- COMPLETED ---");
+
+        debug_assert!(to_thread_count(self.lock_and_t_count.load(Ordering::SeqCst)) > 0);
+        self.lock_and_t_count.fetch_sub(1, Ordering::SeqCst);
+        println!("-(2) COMPLETED: {:?}", thread::current().id());
         None
     }
 }
@@ -736,6 +766,7 @@ impl SizePolicy for ReallocationPolicy {
     fn new(_size: usize) -> Self {
         ReallocationPolicy {
             lock_and_t_count: AtomicUsize::new(0),
+            copy_t_count: AtomicUsize::new(0),
             ra_ptr: AtomicPtr::new(ptr::null_mut()),
         }
     }
@@ -749,20 +780,19 @@ impl SizePolicy for ReallocationPolicy {
         &self,
         queue: &VecQueue<T, P, Self>,
     ) -> Option<()> {
-        let mut lock = 0;
-
         loop {
+            // println!("EXCEED LOOP: {:?}", thread::current().id());
             // try set lock to true and thread_count to 1
-            match self.lock_and_t_count.compare_exchange_weak(
-                lock,
+            // if lock != 0, it is still locked or the last reallocation is not completed yet
+            match self.lock_and_t_count.compare_exchange(
+                0,
                 LOCK_MASK + 1,
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             ) {
                 Ok(_) => {
-                    // TODO remove assert
-                    debug_assert!(to_thread_count(self.lock_and_t_count.load(Ordering::SeqCst)) > 0);
                     // init the reallocation data
+                    debug_assert!(self.copy_t_count.load(Ordering::SeqCst) == 0);
                     debug_assert!(self.ra_ptr.load(Ordering::SeqCst) == ptr::null_mut());
 
                     let init_data = Box::new(ReallocationData::<T, P::Stamp> {
@@ -774,17 +804,19 @@ impl SizePolicy for ReallocationPolicy {
 
                     self.ra_ptr
                         .store(Box::into_raw(init_data) as *mut (), Ordering::SeqCst);
-                    println!("INIT JOIN");
+                    // TODO: correct?
+                    self.copy_t_count.store(1, Ordering::SeqCst);
+                    println!("INIT JOIN: {:?}", thread::current().id());
                     return self.join_copying(queue);
                 }
 
                 Err(val) => {
                     // if already locked, join the copying
                     if is_locked(val) {
-                        return self.try_join(queue, val);
+                        return self.try_join(queue);
                     }
                     // else: retry setting the lock
-                    lock = val;
+                    thread::yield_now();
                 }
             }
         }
@@ -793,8 +825,8 @@ impl SizePolicy for ReallocationPolicy {
     fn invoce_barrier<_T, _P: ProducerConsumerPolicy>(&self, queue: &VecQueue<_T, _P, Self>) {
         let lock = self.lock_and_t_count.load(Ordering::SeqCst);
         if is_locked(lock) {
-            println!("LOCKED");
-            self.try_join(queue, lock);
+            println!("SEE LOCK: {:?}", thread::current().id());
+            self.try_join(queue);
         }
     }
 }

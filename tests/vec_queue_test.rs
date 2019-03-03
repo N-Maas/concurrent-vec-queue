@@ -8,55 +8,82 @@ use std::sync::Arc;
 use std::thread;
 
 #[test]
+fn sequential_realloc_test() {
+    let queue = VecQueue::<usize, MPMCPolicy, ReallocationPolicy>::with_capacity(1);
+
+    queue.append(2);
+    queue.append(42);
+    assert_some_eq(queue.pop(), 2);
+
+    queue.append(33);
+    queue.append(1);
+
+    assert_some_eq(queue.pop(), 42);
+    assert_some_eq(queue.pop(), 33);
+    assert_some_eq(queue.pop(), 1);
+    assert_eq!(queue.pop(), None);
+}
+
+#[test]
+fn spsc_realloc_test() {
+    single_producer_single_consumer_test_template::<MPMCType<(usize, usize), ReallocationPolicy>>(1, 10000);
+}
+
+#[test]
+fn mpmc_realloc_test() {
+    multi_producer_multi_consumer_test_template::<MPMCType<(usize, usize), ReallocationPolicy>>(1, 100, 8, 8);
+}
+
+#[test]
 fn mpmc_basic_test() {
-    basic_sequential_test_template::<MPMCType<usize>>();
-    basic_parallel_test_template::<MPMCType<usize>>();
-    drop_test_template::<MPMCType<DropCounter>>();
+    basic_sequential_test_template::<MPMCType<usize, FixedSizePolicy>>();
+    basic_parallel_test_template::<MPMCType<usize, FixedSizePolicy>>();
+    drop_test_template::<MPMCType<DropCounter, FixedSizePolicy>>();
 }
 
 #[test]
 fn mpmc_single_producer_single_consumer_test() {
-    single_producer_single_consumer_test_template::<MPMCType<(usize, usize)>>(10, 10000);
+    single_producer_single_consumer_test_template::<MPMCType<(usize, usize), FixedSizePolicy>>(10, 10000);
 }
 
 #[test]
 fn mpmc_multi_producer_multi_consumer_test() {
-    multi_producer_multi_consumer_test_template::<MPMCType<(usize, usize)>>(8, 50, 16, 16);
-    multi_producer_multi_consumer_test_template::<MPMCType<(usize, usize)>>(64, 1000, 8, 8);
+    multi_producer_multi_consumer_test_template::<MPMCType<(usize, usize), FixedSizePolicy>>(8, 50, 16, 16);
+    multi_producer_multi_consumer_test_template::<MPMCType<(usize, usize), FixedSizePolicy>>(64, 1000, 8, 8);
 }
 
 #[test]
 fn sc_basic_test() {
-    basic_sequential_test_template::<MPSCType<usize>>();
-    basic_parallel_test_template::<MPSCType<usize>>();
-    drop_test_template::<MPSCType<DropCounter>>();
+    basic_sequential_test_template::<MPSCType<usize, FixedSizePolicy>>();
+    basic_parallel_test_template::<MPSCType<usize, FixedSizePolicy>>();
+    drop_test_template::<MPSCType<DropCounter, FixedSizePolicy>>();
 }
 
 #[test]
 fn sc_single_producer_single_consumer_test() {
-    single_producer_single_consumer_test_template::<MPSCType<(usize, usize)>>(10, 10000);
+    single_producer_single_consumer_test_template::<MPSCType<(usize, usize), FixedSizePolicy>>(10, 10000);
 }
 
 #[test]
 fn sc_multi_producer_test() {
-    multi_producer_multi_consumer_test_template::<MPSCType<(usize, usize)>>(32, 1000, 16, 1);
+    multi_producer_multi_consumer_test_template::<MPSCType<(usize, usize), FixedSizePolicy>>(32, 1000, 16, 1);
 }
 
 #[test]
 fn sp_basic_test() {
-    basic_sequential_test_template::<SPMCType<usize>>();
-    basic_parallel_test_template::<SPMCType<usize>>();
-    drop_test_template::<SPMCType<DropCounter>>();
+    basic_sequential_test_template::<SPMCType<usize, FixedSizePolicy>>();
+    basic_parallel_test_template::<SPMCType<usize, FixedSizePolicy>>();
+    drop_test_template::<SPMCType<DropCounter, FixedSizePolicy>>();
 }
 
 #[test]
 fn sp_single_producer_single_consumer_test() {
-    single_producer_single_consumer_test_template::<SPMCType<(usize, usize)>>(10, 10000);
+    single_producer_single_consumer_test_template::<SPMCType<(usize, usize), FixedSizePolicy>>(10, 10000);
 }
 
 #[test]
 fn sp_multi_consumer_test() {
-    multi_producer_multi_consumer_test_template::<SPMCType<(usize, usize)>>(32, 16000, 1, 16);
+    multi_producer_multi_consumer_test_template::<SPMCType<(usize, usize), FixedSizePolicy>>(32, 16000, 1, 16);
 }
 
 // test correctness in sequential context
@@ -361,17 +388,24 @@ impl<T, P: ProducerConsumerPolicy> MultiProducer<T> for Producer<T, P, FixedSize
     }
 }
 
+impl<T, P: ProducerConsumerPolicy> MultiProducer<T> for Producer<T, P, ReallocationPolicy> {
+    fn append(&self, value: T) -> bool {
+        self.append(value);
+        true
+    }
+}
+
 impl<T, P: ProducerConsumerPolicy, S: SizePolicy> MultiConsumer<T> for Consumer<T, P, S> {
     fn pop(&self) -> Option<T> {
         self.pop()
     }
 }
 
-struct MPMCType<T> {
-    queue: Arc<VecQueue<T, MPMCPolicy, FixedSizePolicy>>,
+struct MPMCType<T, S: SizePolicy> {
+    queue: Arc<VecQueue<T, MPMCPolicy, S>>,
 }
 
-impl<T> Clone for MPMCType<T> {
+impl<T, S: SizePolicy> Clone for MPMCType<T, S> {
     fn clone(&self) -> Self {
         MPMCType {
             queue: self.queue.clone(),
@@ -379,25 +413,33 @@ impl<T> Clone for MPMCType<T> {
     }
 }
 
-impl<T> MultiProducer<T> for MPMCType<T> {
+impl<T> MultiProducer<T> for MPMCType<T, FixedSizePolicy> {
     fn append(&self, value: T) -> bool {
         self.queue.append(value)
     }
 }
 
-impl<T> MultiConsumer<T> for MPMCType<T> {
+impl<T> MultiProducer<T> for MPMCType<T, ReallocationPolicy> {
+    fn append(&self, value: T) -> bool {
+        self.queue.append(value);
+        true
+    }
+}
+
+impl<T, S: SizePolicy> MultiConsumer<T> for MPMCType<T, S> {
     fn pop(&self) -> Option<T> {
         self.queue.pop()
     }
 }
 
-impl<T: 'static> QueueType<T> for MPMCType<T> {
-    type PType = MPMCType<T>;
-    type CType = MPMCType<T>;
+impl<T: 'static, S: 'static + SizePolicy> QueueType<T> for MPMCType<T, S>
+	where MPMCType<T, S>: MultiProducer<T> {
+    type PType = MPMCType<T, S>;
+    type CType = MPMCType<T, S>;
 
-    fn create(size: usize) -> (MPMCType<T>, MPMCType<T>) {
+    fn create(size: usize) -> (MPMCType<T, S>, MPMCType<T, S>) {
         let queue_w = MPMCType {
-            queue: Arc::new(VecQueue::<T, MPMCPolicy, FixedSizePolicy>::with_capacity(
+            queue: Arc::new(VecQueue::<T, MPMCPolicy, S>::with_capacity(
                 size,
             )),
         };
@@ -405,54 +447,63 @@ impl<T: 'static> QueueType<T> for MPMCType<T> {
     }
 }
 
-struct MPSCType<T> {
-    consumer: Consumer<T, MPSCPolicy, FixedSizePolicy>,
+struct MPSCType<T, S: SizePolicy> {
+    consumer: Consumer<T, MPSCPolicy, S>,
 }
 
-impl<T> Clone for MPSCType<T> {
+impl<T, S: SizePolicy> Clone for MPSCType<T, S> {
     fn clone(&self) -> Self {
         panic!("illegal clone on wrapper for single consumer");
     }
 }
 
-impl<T> MultiConsumer<T> for MPSCType<T> {
+impl<T, S: SizePolicy> MultiConsumer<T> for MPSCType<T, S> {
     fn pop(&self) -> Option<T> {
         self.consumer.pop()
     }
 }
 
-impl<T: 'static> QueueType<T> for MPSCType<T> {
-    type PType = Producer<T, MPSCPolicy, FixedSizePolicy>;
-    type CType = MPSCType<T>;
+impl<T: 'static, S: 'static + SizePolicy> QueueType<T> for MPSCType<T, S>
+	where Producer<T, MPSCPolicy, S>: MultiProducer<T> {
+    type PType = Producer<T, MPSCPolicy, S>;
+    type CType = MPSCType<T, S>;
 
-    fn create(size: usize) -> (Producer<T, MPSCPolicy, FixedSizePolicy>, MPSCType<T>) {
-        let (producer, consumer) = VecQueue::<T, MPSCPolicy, FixedSizePolicy>::with_capacity(size);
+    fn create(size: usize) -> (Self::PType, Self::CType) {
+        let (producer, consumer) = VecQueue::<T, MPSCPolicy, S>::with_capacity(size);
         (producer, MPSCType { consumer })
     }
 }
 
-struct SPMCType<T> {
-    producer: Producer<T, SPMCPolicy, FixedSizePolicy>,
+struct SPMCType<T, S: SizePolicy> {
+    producer: Producer<T, SPMCPolicy, S>,
 }
 
-impl<T> Clone for SPMCType<T> {
+impl<T, S: SizePolicy> Clone for SPMCType<T, S> {
     fn clone(&self) -> Self {
         panic!("illegal clone on wrapper for single producer");
     }
 }
 
-impl<T> MultiProducer<T> for SPMCType<T> {
+impl<T> MultiProducer<T> for SPMCType<T, FixedSizePolicy> {
     fn append(&self, value: T) -> bool {
         self.producer.append(value)
     }
 }
 
-impl<T: 'static> QueueType<T> for SPMCType<T> {
-    type PType = SPMCType<T>;
-    type CType = Consumer<T, SPMCPolicy, FixedSizePolicy>;
+impl<T> MultiProducer<T> for SPMCType<T, ReallocationPolicy> {
+    fn append(&self, value: T) -> bool {
+        self.producer.append(value);
+        true
+    }
+}
 
-    fn create(size: usize) -> (SPMCType<T>, Consumer<T, SPMCPolicy, FixedSizePolicy>) {
-        let (producer, consumer) = VecQueue::<T, SPMCPolicy, FixedSizePolicy>::with_capacity(size);
+impl<T: 'static, S: 'static + SizePolicy> QueueType<T> for SPMCType<T, S>
+	where SPMCType<T, S>: MultiProducer<T> {
+    type PType = SPMCType<T, S>;
+    type CType = Consumer<T, SPMCPolicy, S>;
+
+    fn create(size: usize) -> (Self::PType, Self::CType) {
+        let (producer, consumer) = VecQueue::<T, SPMCPolicy, S>::with_capacity(size);
         (SPMCType { producer }, consumer)
     }
 }
