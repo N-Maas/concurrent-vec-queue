@@ -175,7 +175,7 @@ pub struct VecQueue<T, PCPolicy: ProducerConsumerPolicy, SPolicy: SizePolicy> {
     // TODO: not necessarily required to use UnsafeCell (at least with fixed size)?
     data: UnsafeCell<Buffer<StampedElement<T, PCPolicy::Stamp>>>,
     size_policy: SPolicy,
-    empty: AtomicUsize,
+    min: AtomicIsize,
     len: AtomicUsize,
     start_idx: AtomicUsize,
     end_idx: AtomicUsize,
@@ -210,7 +210,7 @@ impl<T, PCPolicy: ProducerConsumerPolicy, SPolicy: SizePolicy> VecQueue<T, PCPol
         let queue = VecQueue {
             data: UnsafeCell::new(Buffer::new(size)),
             size_policy: SPolicy::new(size),
-            empty: AtomicUsize::new(size),
+            min: AtomicIsize::new(0),
             len: AtomicUsize::new(0),
             start_idx: AtomicUsize::new(size),
             end_idx: AtomicUsize::new(size),
@@ -233,9 +233,10 @@ impl<T, PCPolicy: ProducerConsumerPolicy, SPolicy: SizePolicy> VecQueue<T, PCPol
     pub fn append(&self, value: T) -> SPolicy::AppendReturnType {
         let len = self.len.fetch_add(1, Ordering::SeqCst);
 
+        self.size_policy.invoce_barrier(self);
         // test whether queue is full
         // TODO: loop necessary? TODO: Seems to fix deadlock???
-        if len >= self.capacity() {
+        while len >= self.capacity() {
             match self.size_policy.capacity_exceeded(self) {
                 Some(x) => {
                     self.len.fetch_sub(1, Ordering::SeqCst);
@@ -244,7 +245,6 @@ impl<T, PCPolicy: ProducerConsumerPolicy, SPolicy: SizePolicy> VecQueue<T, PCPol
                 None => {}
             }
         }
-        self.size_policy.invoce_barrier(self);
 
         let (idx, stamp) = Self::increase_idx(&self.end_idx, self.capacity(), true);
 
@@ -252,19 +252,19 @@ impl<T, PCPolicy: ProducerConsumerPolicy, SPolicy: SizePolicy> VecQueue<T, PCPol
         self.at(idx).write(value);
         self.at(idx).set_stamp(stamp);
 
-        self.empty.fetch_sub(1, Ordering::SeqCst);
+        self.min.fetch_add(1, Ordering::SeqCst);
         return self.size_policy.return_success();
     }
 
     pub fn pop(&self) -> Option<T> {
-        let empty = self.empty.fetch_add(1, Ordering::SeqCst);
+        let min = self.min.fetch_sub(1, Ordering::SeqCst);
 
+        self.size_policy.invoce_barrier(self);
         // test whether queue is empty
-        if empty >= self.capacity() {
-            self.empty.fetch_sub(1, Ordering::SeqCst);
+        if min <= 0 {
+            self.min.fetch_add(1, Ordering::SeqCst);
             return None;
         }
-        self.size_policy.invoce_barrier(self);
 
         let (idx, stamp) = Self::increase_idx(&self.start_idx, self.capacity(), false);
 
@@ -622,32 +622,31 @@ impl ReallocationPolicy {
         //};
 
         // wait for start_flag, indicating a stable state
-        let len = queue.len.load(Ordering::SeqCst);
-        let empty = queue.empty.load(Ordering::SeqCst);
-        let bias = len + empty - queue.capacity();
-        let t_count = to_thread_count(self.lock_and_t_count.load(Ordering::SeqCst));
-        let copy_cnt = self.copy_t_count.load(Ordering::SeqCst);
-            println!(
-               "len: {:?}, empty: {:?}, bias: {:?}, t_count: {:?}, copy_count: {:?}",
-               len,
-               empty,
-               bias,
-               t_count,
-               copy_cnt
-            );
-        println!("+(1) WAIT FOR START: {:?} - {:?}", thread::current().id(), realloc_data.start_flag.load(Ordering::SeqCst));
+        //let len = queue.len.load(Ordering::SeqCst) as isize;
+        //let min = queue.min.load(Ordering::SeqCst);
+        //let bias = len - min;
+        //let t_count = to_thread_count(self.lock_and_t_count.load(Ordering::SeqCst));
+        //let copy_cnt = self.copy_t_count.load(Ordering::SeqCst);
+        //    println!(
+        //       "len: {:?}, min: {:?}, bias: {:?}, t_count: {:?}, copy_count: {:?}",
+        //       len,
+        //       min,
+        //       bias,
+        //       t_count,
+        //       copy_cnt
+        //    );
+        //println!("+(1) WAIT FOR START: {:?} - {:?}", thread::current().id(), realloc_data.start_flag.load(Ordering::SeqCst));
         while !realloc_data.start_flag.load(Ordering::SeqCst) {
             debug_assert!(self.ra_ptr.load(Ordering::SeqCst) != ptr::null_mut());
             debug_assert!(is_locked(self.lock_and_t_count.load(Ordering::SeqCst)));
 
             // thread count can't decrease in this phase, so this results in a pessimistic estimate
             let t_count = to_thread_count(self.lock_and_t_count.load(Ordering::SeqCst));
-            let bias = queue.len.load(Ordering::SeqCst) + queue.empty.load(Ordering::SeqCst)
-                - queue.capacity();
-            debug_assert!(bias >= t_count);
+            let bias = (queue.len.load(Ordering::SeqCst) as isize) - queue.min.load(Ordering::SeqCst);
+            debug_assert!(bias >= 0 && (bias as usize) >= t_count);
 
             // if bias == thread count, no thread is behind the barrier anymore and a stable state is reached
-            if bias == t_count {
+            if (bias as usize) == t_count {
                 realloc_data.start_flag.store(true, Ordering::SeqCst);
                 break;
             }

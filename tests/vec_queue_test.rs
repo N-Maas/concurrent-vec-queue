@@ -31,7 +31,15 @@ fn spsc_realloc_test() {
 
 #[test]
 fn mpmc_realloc_test() {
+    multi_producer_multi_consumer_test_template::<MPMCType<(usize, usize), ReallocationPolicy>>(1, 1000, 2, 2);
     multi_producer_multi_consumer_test_template::<MPMCType<(usize, usize), ReallocationPolicy>>(1, 100, 8, 8);
+    multi_producer_multi_consumer_test_template::<MPMCType<(usize, usize), ReallocationPolicy>>(1, 1000, 128, 128);
+}
+
+#[test]
+fn single_p_or_single_c_realloc_test() {
+    multi_producer_multi_consumer_test_template::<MPSCType<(usize, usize), ReallocationPolicy>>(1, 1000, 32, 1);
+    multi_producer_multi_consumer_test_template::<SPMCType<(usize, usize), ReallocationPolicy>>(1, 32000, 1, 32);
 }
 
 #[test]
@@ -204,7 +212,7 @@ fn multi_producer_multi_consumer_test_template<QType: QueueType<(usize, usize)>>
             let mut stream = MarkedStream::new(i, val_count_per_thread);
 
             for x in &mut stream {
-                while !p.append(x) {}
+                while !p.append(x) { thread::yield_now(); }
             }
             return stream;
         }));
@@ -266,6 +274,7 @@ fn pop_next<T>(consumer: &impl MultiConsumer<T>) -> T {
         if let Some(x) = consumer.pop() {
             return x;
         }
+        thread::yield_now();
     }
 }
 
