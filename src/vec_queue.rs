@@ -56,8 +56,13 @@ pub struct StampedElement<T, S: AtomicStamp> {
 }
 
 impl<T, S: AtomicStamp> StampedElement<T, S> {
-    pub fn init(&mut self, val: T, stamp: S::Value) {
-        self.value = val;
+    pub fn init_value(&mut self, val: T) {
+        unsafe {
+            ptr::write(&mut self.value as *mut T, val);
+        }
+    }
+
+    pub fn init_stamp(&mut self, stamp: S::Value) {
         self.stamp = S::new(stamp);
     }
 
@@ -82,9 +87,7 @@ impl<T, S: AtomicStamp> StampedElement<T, S> {
     pub fn write(&mut self, val: T) {
         debug_assert!(!self.is_valid());
 
-        unsafe {
-            ptr::write(&mut self.value as *mut T, val);
-        }
+        self.init_value(val);
     }
 }
 
@@ -183,8 +186,6 @@ pub trait SizePolicy: Sized {
 
 // test with fixed size
 pub struct VecQueue<T, PCPolicy: ProducerConsumerPolicy, SPolicy: SizePolicy> {
-    //data: Vec<StampedElement<T>>,
-    // TODO: not necessarily required to use UnsafeCell (at least with fixed size)?
     data: UnsafeCell<Buffer<StampedElement<T, PCPolicy::Stamp>>>,
     size_policy: SPolicy,
     min: AtomicIsize,
@@ -232,7 +233,7 @@ impl<T, PCPolicy: ProducerConsumerPolicy, SPolicy: SizePolicy> VecQueue<T, PCPol
 
         for idx in 0..size {
             // TODO: atomic operation probably unnecessary?
-            queue.at(idx).set_stamp(PCPolicy::to_stamp(idx, false));
+            queue.at(idx).init_stamp(PCPolicy::to_stamp(idx, false));
         }
         return queue;
     }
@@ -640,12 +641,10 @@ impl ReallocationPolicy {
                 let el = realloc.new_buffer.at(i);
 
                 if q_idx < end_idx {
-                    el.init(
-                        queue.at(q_idx & (old_cap - 1)).read(),
-                        P::to_stamp(i + new_cap, true),
-                    );
+                    el.init_value(queue.at(q_idx & (old_cap - 1)).read());
+                    el.init_stamp(P::to_stamp(i + new_cap, true));
                 } else {
-                    el.set_stamp(P::to_stamp(i, false));
+                    el.init_stamp(P::to_stamp(i, false));
                 }
             }
         }
@@ -665,6 +664,7 @@ impl ReallocationPolicy {
             ptr::swap(queue.data.get(), &mut (*realloc_ptr).new_buffer);
             ptr::drop_in_place(realloc_ptr);
         }
+        // not necessary, but probably better then risking a pointer to invalid memory
         self.ra_ptr.store(ptr::null_mut(), Ordering::SeqCst);
 
         // reset indizes (start_idx is reset to capacity)

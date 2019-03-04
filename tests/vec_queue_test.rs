@@ -8,106 +8,179 @@ use std::sync::Arc;
 use std::thread;
 
 #[test]
-fn sequential_realloc_test() {
-    let queue = VecQueue::<usize, MPMCPolicy, ReallocationPolicy>::with_capacity(1);
-
-    queue.append(2);
-    queue.append(42);
-    assert_some_eq(queue.pop(), 2);
-
-    queue.append(33);
-    queue.append(1);
-
-    assert_some_eq(queue.pop(), 42);
-    assert_some_eq(queue.pop(), 33);
-    assert_some_eq(queue.pop(), 1);
-    assert_eq!(queue.pop(), None);
+fn realloc_mpmc_basic_test() {
+    basic_sequential_test_template::<MPMCType<usize, ReallocationPolicy>>(true);
+    basic_parallel_test_template::<MPMCType<usize, ReallocationPolicy>>();
+    drop_test_template::<MPMCType<DropCounter, ReallocationPolicy>>(true);
 }
 
 #[test]
-fn spsc_realloc_test() {
-    single_producer_single_consumer_test_template::<MPMCType<(usize, usize), ReallocationPolicy>>(1, 10000);
+fn realloc_mpmc_single_producer_single_consumer_test() {
+    single_producer_single_consumer_test_template::<MPMCType<(usize, usize), ReallocationPolicy>>(
+        1, 10000,
+    );
 }
 
 #[test]
-fn mpmc_realloc_test() {
-    multi_producer_multi_consumer_test_template::<MPMCType<(usize, usize), ReallocationPolicy>>(1, 1000, 2, 2);
-    multi_producer_multi_consumer_test_template::<MPMCType<(usize, usize), ReallocationPolicy>>(1, 100, 8, 8);
-    multi_producer_multi_consumer_test_template::<MPMCType<(usize, usize), ReallocationPolicy>>(1, 1000, 128, 128);
+fn realloc_mpmc_multi_producer_multi_consumer_test() {
+    multi_producer_multi_consumer_test_template::<MPMCType<(usize, usize), ReallocationPolicy>>(
+        1, 1000, 2, 2,
+    );
+    multi_producer_multi_consumer_test_template::<MPMCType<(usize, usize), ReallocationPolicy>>(
+        1, 100, 16, 16,
+    );
+    multi_producer_multi_consumer_test_template::<MPMCType<(usize, usize), ReallocationPolicy>>(
+        1, 250, 128, 128,
+    );
+    multi_producer_multi_consumer_test_template::<MPMCType<(usize, usize), ReallocationPolicy>>(
+        1, 250, 64, 1,
+    );
+    multi_producer_multi_consumer_test_template::<MPMCType<(usize, usize), ReallocationPolicy>>(
+        1, 16000, 1, 64,
+    );
+    multi_producer_multi_consumer_test_template::<MPMCType<(usize, usize), ReallocationPolicy>>(
+        1, 250, 64, 8,
+    );
+    multi_producer_multi_consumer_test_template::<MPMCType<(usize, usize), ReallocationPolicy>>(
+        1, 2000, 8, 64,
+    );
 }
 
 #[test]
-fn single_p_or_single_c_realloc_test() {
-    multi_producer_multi_consumer_test_template::<MPSCType<(usize, usize), ReallocationPolicy>>(1, 1000, 32, 1);
-    multi_producer_multi_consumer_test_template::<SPMCType<(usize, usize), ReallocationPolicy>>(1, 32000, 1, 32);
+fn realloc_sc_basic_test() {
+    basic_sequential_test_template::<MPSCType<usize, ReallocationPolicy>>(true);
+    basic_parallel_test_template::<MPSCType<usize, ReallocationPolicy>>();
+    drop_test_template::<MPSCType<DropCounter, ReallocationPolicy>>(true);
 }
 
 #[test]
-fn mpmc_basic_test() {
-    basic_sequential_test_template::<MPMCType<usize, FixedSizePolicy>>();
+fn realloc_sc_single_producer_single_consumer_test() {
+    single_producer_single_consumer_test_template::<MPSCType<(usize, usize), ReallocationPolicy>>(
+        1, 10000,
+    );
+}
+
+#[test]
+fn realloc_sc_multi_producer_test() {
+    multi_producer_multi_consumer_test_template::<MPSCType<(usize, usize), ReallocationPolicy>>(
+        1, 1000, 2, 1,
+    );
+    multi_producer_multi_consumer_test_template::<MPSCType<(usize, usize), ReallocationPolicy>>(
+        1, 250, 128, 1,
+    );
+}
+
+#[test]
+fn realloc_sp_basic_test() {
+    basic_sequential_test_template::<SPMCType<usize, ReallocationPolicy>>(true);
+    basic_parallel_test_template::<SPMCType<usize, ReallocationPolicy>>();
+    drop_test_template::<SPMCType<DropCounter, ReallocationPolicy>>(true);
+}
+
+#[test]
+fn realloc_sp_single_producer_single_consumer_test() {
+    single_producer_single_consumer_test_template::<SPMCType<(usize, usize), ReallocationPolicy>>(
+        1, 10000,
+    );
+}
+
+#[test]
+fn realloc_sp_multi_consumer_test() {
+    multi_producer_multi_consumer_test_template::<SPMCType<(usize, usize), ReallocationPolicy>>(
+        1, 2000, 1, 2,
+    );
+    multi_producer_multi_consumer_test_template::<SPMCType<(usize, usize), ReallocationPolicy>>(
+        1, 32000, 1, 128,
+    );
+}
+
+#[test]
+fn fixed_size_mpmc_basic_test() {
+    basic_sequential_test_template::<MPMCType<usize, FixedSizePolicy>>(false);
     basic_parallel_test_template::<MPMCType<usize, FixedSizePolicy>>();
-    drop_test_template::<MPMCType<DropCounter, FixedSizePolicy>>();
+    drop_test_template::<MPMCType<DropCounter, FixedSizePolicy>>(false);
 }
 
 #[test]
-fn mpmc_single_producer_single_consumer_test() {
-    single_producer_single_consumer_test_template::<MPMCType<(usize, usize), FixedSizePolicy>>(10, 10000);
+fn fixed_size_mpmc_single_producer_single_consumer_test() {
+    single_producer_single_consumer_test_template::<MPMCType<(usize, usize), FixedSizePolicy>>(
+        10, 10000,
+    );
 }
 
 #[test]
-fn mpmc_multi_producer_multi_consumer_test() {
-    multi_producer_multi_consumer_test_template::<MPMCType<(usize, usize), FixedSizePolicy>>(8, 50, 16, 16);
-    multi_producer_multi_consumer_test_template::<MPMCType<(usize, usize), FixedSizePolicy>>(64, 1000, 8, 8);
+fn fixed_size_mpmc_multi_producer_multi_consumer_test() {
+    multi_producer_multi_consumer_test_template::<MPMCType<(usize, usize), FixedSizePolicy>>(
+        8, 100, 32, 32,
+    );
+    multi_producer_multi_consumer_test_template::<MPMCType<(usize, usize), FixedSizePolicy>>(
+        64, 1000, 8, 8,
+    );
 }
 
 #[test]
-fn sc_basic_test() {
-    basic_sequential_test_template::<MPSCType<usize, FixedSizePolicy>>();
+fn fixed_size_sc_basic_test() {
+    basic_sequential_test_template::<MPSCType<usize, FixedSizePolicy>>(false);
     basic_parallel_test_template::<MPSCType<usize, FixedSizePolicy>>();
-    drop_test_template::<MPSCType<DropCounter, FixedSizePolicy>>();
+    drop_test_template::<MPSCType<DropCounter, FixedSizePolicy>>(false);
 }
 
 #[test]
-fn sc_single_producer_single_consumer_test() {
-    single_producer_single_consumer_test_template::<MPSCType<(usize, usize), FixedSizePolicy>>(10, 10000);
+fn fixed_size_sc_single_producer_single_consumer_test() {
+    single_producer_single_consumer_test_template::<MPSCType<(usize, usize), FixedSizePolicy>>(
+        10, 10000,
+    );
 }
 
 #[test]
-fn sc_multi_producer_test() {
-    multi_producer_multi_consumer_test_template::<MPSCType<(usize, usize), FixedSizePolicy>>(32, 1000, 16, 1);
+fn fixed_size_sc_multi_producer_test() {
+    multi_producer_multi_consumer_test_template::<MPSCType<(usize, usize), FixedSizePolicy>>(
+        32, 1000, 16, 1,
+    );
 }
 
 #[test]
-fn sp_basic_test() {
-    basic_sequential_test_template::<SPMCType<usize, FixedSizePolicy>>();
+fn fixed_size_sp_basic_test() {
+    basic_sequential_test_template::<SPMCType<usize, FixedSizePolicy>>(false);
     basic_parallel_test_template::<SPMCType<usize, FixedSizePolicy>>();
-    drop_test_template::<SPMCType<DropCounter, FixedSizePolicy>>();
+    drop_test_template::<SPMCType<DropCounter, FixedSizePolicy>>(false);
 }
 
 #[test]
-fn sp_single_producer_single_consumer_test() {
-    single_producer_single_consumer_test_template::<SPMCType<(usize, usize), FixedSizePolicy>>(10, 10000);
+fn fixed_size_sp_single_producer_single_consumer_test() {
+    single_producer_single_consumer_test_template::<SPMCType<(usize, usize), FixedSizePolicy>>(
+        10, 10000,
+    );
 }
 
 #[test]
-fn sp_multi_consumer_test() {
-    multi_producer_multi_consumer_test_template::<SPMCType<(usize, usize), FixedSizePolicy>>(32, 16000, 1, 16);
+fn fixed_size_sp_multi_consumer_test() {
+    multi_producer_multi_consumer_test_template::<SPMCType<(usize, usize), FixedSizePolicy>>(
+        32, 16000, 1, 16,
+    );
 }
 
 // test correctness in sequential context
-fn basic_sequential_test_template<QType: QueueType<usize>>() {
+fn basic_sequential_test_template<QType: QueueType<usize>>(realloc: bool) {
     let (prod, con) = QType::create(2);
 
+    assert_eq!(con.pop(), None);
     prod.append(2);
     prod.append(42);
     assert_some_eq(con.pop(), 2);
-
     prod.append(33);
-    // only for fixed size
-    assert!(!prod.append(10), "queue is already full");
+
+    if realloc {
+        prod.append(10);
+    } else {
+        assert!(!prod.append(10), "queue is already full");
+    }
 
     assert_some_eq(con.pop(), 42);
     assert_some_eq(con.pop(), 33);
+    if realloc {
+        assert_some_eq(con.pop(), 10);
+    }
     assert_eq!(con.pop(), None);
 }
 
@@ -127,8 +200,8 @@ fn basic_parallel_test_template<QType: QueueType<usize>>() {
     }
 }
 
-fn drop_test_template<QType: QueueType<DropCounter>>() {
-    let (prod, con) = QType::create(5);
+fn drop_test_template<QType: QueueType<DropCounter>>(realloc: bool) {
+    let (prod, con) = QType::create(if realloc { 1 } else { 5 });
     let count = Arc::new(AtomicUsize::new(0));
     {
         let (p, c) = (prod, con);
@@ -212,7 +285,9 @@ fn multi_producer_multi_consumer_test_template<QType: QueueType<(usize, usize)>>
             let mut stream = MarkedStream::new(i, val_count_per_thread);
 
             for x in &mut stream {
-                while !p.append(x) { thread::yield_now(); }
+                while !p.append(x) {
+                    thread::yield_now();
+                }
             }
             return stream;
         }));
@@ -442,15 +517,15 @@ impl<T, S: SizePolicy> MultiConsumer<T> for MPMCType<T, S> {
 }
 
 impl<T: 'static, S: 'static + SizePolicy> QueueType<T> for MPMCType<T, S>
-	where MPMCType<T, S>: MultiProducer<T> {
+where
+    MPMCType<T, S>: MultiProducer<T>,
+{
     type PType = MPMCType<T, S>;
     type CType = MPMCType<T, S>;
 
     fn create(size: usize) -> (MPMCType<T, S>, MPMCType<T, S>) {
         let queue_w = MPMCType {
-            queue: Arc::new(VecQueue::<T, MPMCPolicy, S>::with_capacity(
-                size,
-            )),
+            queue: Arc::new(VecQueue::<T, MPMCPolicy, S>::with_capacity(size)),
         };
         (queue_w.clone(), queue_w)
     }
@@ -473,7 +548,9 @@ impl<T, S: SizePolicy> MultiConsumer<T> for MPSCType<T, S> {
 }
 
 impl<T: 'static, S: 'static + SizePolicy> QueueType<T> for MPSCType<T, S>
-	where Producer<T, MPSCPolicy, S>: MultiProducer<T> {
+where
+    Producer<T, MPSCPolicy, S>: MultiProducer<T>,
+{
     type PType = Producer<T, MPSCPolicy, S>;
     type CType = MPSCType<T, S>;
 
@@ -507,7 +584,9 @@ impl<T> MultiProducer<T> for SPMCType<T, ReallocationPolicy> {
 }
 
 impl<T: 'static, S: 'static + SizePolicy> QueueType<T> for SPMCType<T, S>
-	where SPMCType<T, S>: MultiProducer<T> {
+where
+    SPMCType<T, S>: MultiProducer<T>,
+{
     type PType = SPMCType<T, S>;
     type CType = Consumer<T, SPMCPolicy, S>;
 
