@@ -5,3 +5,10 @@ authors = ["Nikolai <ucywg@student.kit.edu>"]
 edition = "2018"
 
 [dependencies]
+
+[dev-dependencies]
+criterion = "0.2"
+
+[[bench]]
+name = "vec_queue_bench"
+harness = false

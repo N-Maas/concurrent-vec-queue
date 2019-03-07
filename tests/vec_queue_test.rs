@@ -231,7 +231,9 @@ fn single_producer_single_consumer_test_template<QType: QueueType<(usize, usize)
         let mut stream = MarkedStream::new(0, val_count);
 
         for x in &mut stream {
-            while !prod.append(x) {}
+            while !prod.append(x) {
+                thread::yield_now();
+            }
         }
         return stream;
     });
