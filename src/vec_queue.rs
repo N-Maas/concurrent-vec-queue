@@ -67,11 +67,11 @@ impl<T, S: AtomicStamp> StampedElement<T, S> {
     }
 
     pub fn get_stamp(&self) -> S::Value {
-        self.stamp.load(Ordering::SeqCst)
+        self.stamp.load(Ordering::Acquire)
     }
 
     pub fn set_stamp(&mut self, val: S::Value) {
-        self.stamp.store(val, Ordering::SeqCst)
+        self.stamp.store(val, Ordering::Release)
     }
 
     pub fn is_valid(&self) -> bool {
@@ -209,7 +209,7 @@ impl<T, PCPolicy: ProducerConsumerPolicy, SPolicy: SizePolicy> VecQueue<T, PCPol
     ) -> (usize, <PCPolicy::Stamp as AtomicStamp>::Value) {
         debug_assert!(len.is_power_of_two());
 
-        let idx = counter.fetch_add(1, Ordering::SeqCst);
+        let idx = counter.fetch_add(1, Ordering::Relaxed);
         (idx & (len - 1), PCPolicy::to_stamp(idx, is_write))
     }
 
@@ -244,14 +244,14 @@ impl<T, PCPolicy: ProducerConsumerPolicy, SPolicy: SizePolicy> VecQueue<T, PCPol
 
     // TODO: more relaxed Ordering possible?
     pub fn append(&self, value: T) -> SPolicy::AppendReturnType {
-        let len = self.len.fetch_add(1, Ordering::SeqCst);
+        let len = self.len.fetch_add(1, Ordering::Acquire);
 
         self.size_policy.invoce_barrier(self);
         // test whether queue is full
         // TODO: loop necessary? TODO: Seems to fix deadlock???
         while len >= self.capacity() {
             if let Some(x) = self.size_policy.capacity_exceeded(self) {
-                self.len.fetch_sub(1, Ordering::SeqCst);
+                self.len.fetch_sub(1, Ordering::Relaxed);
                 return x;
             }
         }
@@ -262,17 +262,17 @@ impl<T, PCPolicy: ProducerConsumerPolicy, SPolicy: SizePolicy> VecQueue<T, PCPol
         self.at(idx).write(value);
         self.at(idx).set_stamp(stamp);
 
-        self.min.fetch_add(1, Ordering::SeqCst);
+        self.min.fetch_add(1, Ordering::Release);
         SPolicy::return_success()
     }
 
     pub fn pop(&self) -> Option<T> {
-        let min = self.min.fetch_sub(1, Ordering::SeqCst);
+        let min = self.min.fetch_sub(1, Ordering::Acquire);
 
         self.size_policy.invoce_barrier(self);
         // test whether queue is empty
         if min <= 0 {
-            self.min.fetch_add(1, Ordering::SeqCst);
+            self.min.fetch_add(1, Ordering::Relaxed);
             return None;
         }
 
@@ -282,7 +282,7 @@ impl<T, PCPolicy: ProducerConsumerPolicy, SPolicy: SizePolicy> VecQueue<T, PCPol
         let val = self.at(idx).read();
         self.at(idx).set_stamp(stamp);
 
-        self.len.fetch_sub(1, Ordering::SeqCst);
+        self.len.fetch_sub(1, Ordering::Release);
         Some(val)
     }
 }
