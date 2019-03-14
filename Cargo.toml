@@ -8,6 +8,7 @@ edition = "2018"
 
 [dev-dependencies]
 criterion = "0.2"
+crossbeam-queue = "0.1"
 
 [[bench]]
 name = "vec_queue_bench"
