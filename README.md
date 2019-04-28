@@ -1,4 +1,4 @@
-#concurrent-vec-queue
+# concurrent-vec-queue
 
 This is an experimental implementation of a concurrent FIFO queue. The algorithm
 uses lock-free programming techniques and vec-like memory allocation to achieve

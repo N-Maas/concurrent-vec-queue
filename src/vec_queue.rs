@@ -617,7 +617,7 @@ impl ReallocationPolicy {
         self.await_completion()
     }
 
-    // must be called only by one thread per reallocation, performs the final steps
+    // function that actually performs the data copying
     fn copy_data<T, P: ProducerConsumerPolicy>(
         realloc: &ReallocationData<T, P::Stamp>,
         queue: &VecQueue<T, P, Self>,
